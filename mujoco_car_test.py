@@ -21,8 +21,20 @@ if not glfw.init():
     raise Exception("GLFW initialization failed")
 
 window = glfw.create_window(1000, 800, "Monster Truck Follow Cam", None, None)
+if not window:
+    glfw.terminate()
+    raise Exception("GLFW window creation failed")
+
 glfw.make_context_current(window)
-glfw.swap_interval(1)
+glfw.swap_interval(1)  # request VSync (driver may override on Windows)
+
+# Report monitor refresh rate (helps explain speed differences)
+try:
+    mode = glfw.get_video_mode(glfw.get_primary_monitor())
+    if mode:
+        print(f"Monitor refresh: {mode.refresh_rate} Hz")
+except Exception:
+    pass
 
 cam = mujoco.MjvCamera()
 opt = mujoco.MjvOption()
@@ -59,7 +71,13 @@ glfw.set_key_callback(window, key_callback)
 # ==============================
 print("Controls: W=Forward | S=Reverse | SPACE=Stop | ESC=Quit")
 frame_skip = 10
-last_time = time.time()
+
+# Real-time pacing toggle
+REALTIME = True
+timestep = model.opt.timestep  # 0.001 from your XML
+sim_start_wall = time.perf_counter()  # wall-clock when sim begins
+
+last_print = sim_start_wall
 
 # Get chassis body id
 chassis_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "chassis")
@@ -77,27 +95,38 @@ while not glfw.window_should_close(window):
     for _ in range(frame_skip):
         mujoco.mj_step(model, data)
 
-    # Get chassis position
+    # ---- Real-time pacing: sleep so that sim time ~= wall time ----
+    if REALTIME:
+        target_wall = sim_start_wall + data.time  # when we *should* be at in wall time
+        now = time.perf_counter()
+        if now < target_wall:
+            time.sleep(target_wall - now)
+
+    # Get chassis position & update camera to follow the car
     chassis_pos = data.xpos[chassis_id].copy()
-
-    # Update camera to follow the car
     cam.lookat[:] = chassis_pos
-    cam.distance = 3.0  # fixed distance
-    cam.azimuth = 90    # side view; adjust to taste
-    cam.elevation = -25 # slightly above ground
+    cam.distance = 3.0
+    cam.azimuth = 90
+    cam.elevation = -25
 
-    # Render
-    mujoco.mjv_updateScene(model, data, opt, None, cam, mujoco.mjtCatBit.mjCAT_ALL, scene)
-    viewport = mujoco.MjrRect(0, 0, *glfw.get_framebuffer_size(window))
-    mujoco.mjr_render(viewport, scene, context)
+    # Render (guard against minimized window)
+    w, h = glfw.get_framebuffer_size(window)
+    if w > 0 and h > 0:
+        mujoco.mjv_updateScene(model, data, opt, None, cam, mujoco.mjtCatBit.mjCAT_ALL, scene)
+        viewport = mujoco.MjrRect(0, 0, w, h)
+        mujoco.mjr_render(viewport, scene, context)
 
     glfw.swap_buffers(window)
     glfw.poll_events()
 
-    # Optional: print simulation time
-    if time.time() - last_time > 1.0:
-        print(f"Sim time: {data.time:.2f} s")
-        last_time = time.time()
+    # Optional: print simulation time once per second
+    now = time.perf_counter()
+    if now - last_print > 1.0:
+        # Effective speed ratio: how many sim seconds per wall second
+        # (since we're pacing, this should be ~1.0)
+        speed_ratio = (data.time) / (now - sim_start_wall + 1e-9)
+        print(f"Sim time: {data.time:.2f} s | speed x{speed_ratio:.2f}")
+        last_print = now
 
 glfw.terminate()
 print("Simulation terminated.")

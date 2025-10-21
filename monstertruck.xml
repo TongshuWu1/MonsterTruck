@@ -1,5 +1,5 @@
 <mujoco model="monster_truck_flip">
-  <option gravity="0 0 -9.81" integrator="RK4" timestep="0.002"/>
+  <option gravity="0 0 -9.81" integrator="RK4" timestep="0.001"/>
   <compiler angle="radian"/>
 
   <default>
@@ -62,7 +62,7 @@
 
   <!-- Rear-wheel motors for throttle -->
   <actuator>
-    <motor name="rear_left_motor" joint="j_rl" gear="250"/>
-    <motor name="rear_right_motor" joint="j_rr" gear="250"/>
+    <motor name="rear_left_motor" joint="j_rl" gear="280"/>
+    <motor name="rear_right_motor" joint="j_rr" gear="280"/>
   </actuator>
 </mujoco>
