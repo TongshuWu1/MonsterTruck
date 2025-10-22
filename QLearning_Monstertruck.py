@@ -1,124 +1,109 @@
-# QLearning_Monstertruck.py
-# Balanced reward shaping for monster-truck flipping
-# Adds option to load existing Q-table and continue training
-# Requires: pip install mujoco glfw numpy
+# QLearning_Monstertruck_YPR.py
+# Q-learning monster-truck flipping using roll, pitch, and throttle (pitch-only spin reward)
+# Simplified shaping: integrated baseline into time penalty
+# Requires: pip install mujoco glfw numpy matplotlib
 
 import os, json, math, time
 import numpy as np
+import matplotlib.pyplot as plt
 import mujoco
 from mujoco.glfw import glfw
 
 
-# ============================================================
-# Helper functions
-# ============================================================
 def clip(v, lo, hi):
     return lo if v < lo else (hi if v > hi else v)
 
 
 # ============================================================
+# Utility: quaternion → roll, pitch
+# ============================================================
+def quat_to_rp(q):
+    w, x, y, z = q
+    t0 = +2.0 * (w * x + y * z)
+    t1 = +1.0 - 2.0 * (x * x + y * y)
+    roll = math.atan2(t0, t1)
+
+    t2 = +2.0 * (w * y - z * x)
+    t2 = +1.0 if t2 > +1.0 else (-1.0 if t2 < -1.0 else t2)
+    pitch = math.asin(t2)
+    return roll, pitch
+
+
+# ============================================================
 # Environment
 # ============================================================
-class MonsterTruckFlipEnv:
-    """
-    Discrete throttle env for flipping a truck upright.
-
-    Observations:
-        up_z         : cosine of uprightness
-        ang_speed    : angular speed magnitude
-        wheel_speed  : mean of rear wheel speeds
-        flip_rate    : roll rate (rad/s)
-        throttle     : last applied throttle
-
-    Reward shaping:
-        + Continuous upright reward (smooth shaping)
-        + Progress reward (encourages improvement)
-        + Spin encouragement while upside-down
-        + Big terminal bonus when upright and stable
-        - Energy and time penalties
-    """
-
+class MonsterTruckFlipEnvYPR:
     def __init__(self, xml_path="monstertruck.xml",
                  frame_skip=10, max_steps=2000,
-                 render=False, realtime=True):
-
+                 render=False, realtime=False):
         if not os.path.exists(xml_path):
             raise FileNotFoundError(f"Cannot find {xml_path}")
         self.model = mujoco.MjModel.from_xml_path(xml_path)
         self.data = mujoco.MjData(self.model)
-
         self.frame_skip = frame_skip
         self.max_steps = max_steps
         self.render_enabled = render
         self.realtime = realtime
         self.dt = self.model.opt.timestep
 
-        # Actions
-        self.actions = np.array([-1.0, -0.5, 0.0, 0.5, 1.0], dtype=np.float32)
-
-        # Stability thresholds
-        self.upright_threshold = 0.93
-        self.stable_rate_tol = 1.5
+        # Expanded 9-level throttle
+        self.actions = np.linspace(-1.0, 1.0, 9)
+        self.last_throttle = 0.0
+        self.step_count = 0
+        self.hold_counter = 0
         self.hold_needed = 4
 
-        # Runtime state
-        self.hold_counter = 0
-        self.step_count = 0
-        self.last_throttle = 0.0
-        self.prev_upright = 0.0
-
-        # Mujoco object references
         self.body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "chassis")
-        self.j_rl = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "j_rl")
-        self.j_rr = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "j_rr")
-        self.dof_rl = self.model.jnt_dofadr[self.j_rl] if self.j_rl != -1 else None
-        self.dof_rr = self.model.jnt_dofadr[self.j_rr] if self.j_rr != -1 else None
 
-        # Rendering
-        self.window = None
-        if self.render_enabled:
+        # Tuned reward weights (baseline integrated into time)
+        self.R = dict(
+            upright=20.0,    # reward for improving uprightness
+            spin=1,       # encourage forward/back rotation (pitch)
+            settle=0.5,     # penalty for moving near upright
+            energy=0.01,    # energy cost
+            time=0.035,       # stronger per-step penalty (includes baseline)
+            success=800.0,  # terminal success
+        )
+
+        self.prev_upright = 0.0
+        self.prev_roll, self.prev_pitch = 0.0, 0.0
+
+        self._viewer_ready = False
+        if render:
             self._init_viewer()
-
-        # Reward weights (easy tuning)
-        self.R = {
-            "upright": 10.0,
-            "progress": 20.0,
-            "spin": 0.3,
-            "energy": -0.05,
-            "time": -0.001,
-            "success": 100.0
-        }
 
     # ---------------------- Rendering ----------------------
     def _init_viewer(self):
+        if self._viewer_ready:
+            return
         if not glfw.init():
             raise RuntimeError("GLFW init failed")
-        self.window = glfw.create_window(1000, 800, "MonsterTruck Q-Learning", None, None)
-        if not self.window:
-            glfw.terminate()
-            raise RuntimeError("GLFW window creation failed")
+        self.window = glfw.create_window(1000, 800, "MonsterTruck YPR Flip", None, None)
         glfw.make_context_current(self.window)
-        glfw.swap_interval(1)
         self.cam = mujoco.MjvCamera()
         self.opt = mujoco.MjvOption()
         self.scene = mujoco.MjvScene(self.model, maxgeom=20000)
         self.context = mujoco.MjrContext(self.model, mujoco.mjtFontScale.mjFONTSCALE_150)
         self.cam.distance, self.cam.azimuth, self.cam.elevation = 3.0, 90, -25
+        self._viewer_ready = True
 
     def _render(self):
-        if not self.render_enabled or self.window is None:
+        if not self.render_enabled:
             return
+        if not self._viewer_ready:
+            self._init_viewer()
         if glfw.window_should_close(self.window):
-            self.render_enabled = False
             glfw.destroy_window(self.window)
             glfw.terminate()
+            self._viewer_ready = False
+            self.render_enabled = False
             return
+
         self.cam.lookat[:] = self.data.xpos[self.body_id]
         mujoco.mjv_updateScene(self.model, self.data, self.opt, None, self.cam,
                                mujoco.mjtCatBit.mjCAT_ALL, self.scene)
         w, h = glfw.get_framebuffer_size(self.window)
-        if w > 0 and h > 0:
-            mujoco.mjr_render(mujoco.MjrRect(0, 0, w, h), self.scene, self.context)
+        mujoco.mjr_render(mujoco.MjrRect(0, 0, w, h), self.scene, self.context)
         glfw.swap_buffers(self.window)
         glfw.poll_events()
 
@@ -127,27 +112,25 @@ class MonsterTruckFlipEnv:
         mujoco.mj_resetData(self.model, self.data)
         self.data.qpos[:3] = np.array([0, 0, 0.6]) + 0.02 * np.random.randn(3)
         self.data.qvel[:] = 0.0
-        self.data.qpos[3:7] = np.array([0, 1, 0, 0])  # upside down
-        self.hold_counter = 0
-        self.step_count = 0
-        self.prev_upright = 0.0
+        self.data.qpos[3:7] = np.array([0, 1, 0, 0])  # upside-down start
         mujoco.mj_forward(self.model, self.data)
+        self.step_count = 0
+        self.last_throttle = 0.0
+        self.hold_counter = 0
+        self.prev_upright = -1.0  # start fully inverted
+        self.prev_roll, self.prev_pitch = 0.0, 0.0
         return self._get_obs()
 
-    def _get_obs(self):
-        R = self.data.xmat[self.body_id].reshape(3, 3)
-        up_z = float(R[2, 2])
-        ang_speed = float(np.linalg.norm(self.data.cvel[self.body_id][3:]))
-        flip_rate = float((R.T @ self.data.cvel[self.body_id][3:])[0])
-        if self.dof_rl is not None and self.dof_rr is not None:
-            v_rl = self.data.qvel[self.dof_rl]
-            v_rr = self.data.qvel[self.dof_rr]
-            wheel_speed = 0.5 * (v_rl + v_rr)
-        else:
-            wheel_speed = 0.0
-        return np.array([up_z, ang_speed, wheel_speed, flip_rate, self.last_throttle], dtype=np.float32)
+    def _get_rp(self):
+        q = np.copy(self.data.qpos[3:7])
+        return quat_to_rp(q)
 
-    def step(self, a_idx: int):
+    def _get_obs(self):
+        roll, pitch = self._get_rp()
+        u = math.cos(roll) * math.cos(pitch)
+        return np.array([u, roll, pitch, self.last_throttle], dtype=np.float32)
+
+    def step(self, a_idx):
         throttle = float(self.actions[a_idx])
         self.last_throttle = throttle
         done, success = False, False
@@ -157,48 +140,54 @@ class MonsterTruckFlipEnv:
                 self.data.ctrl[0] = throttle
                 self.data.ctrl[1] = throttle
             mujoco.mj_step(self.model, self.data)
+            if self.realtime:
+                time.sleep(self.dt)
 
-        R = self.data.xmat[self.body_id].reshape(3, 3)
-        up_z = float(R[2, 2])
-        ang_vel_world = self.data.cvel[self.body_id][3:]
-        ang_vel_body = R.T @ ang_vel_world
-        flip_rate = float(ang_vel_body[0])
+        roll, pitch = self._get_rp()
+        u = math.cos(roll) * math.cos(pitch)
+        du = u - self.prev_upright
+        self.prev_upright = u
 
-        # Reward
-        upright = (up_z + 1) / 2.0
-        delta_upright = upright - self.prev_upright
-        self.prev_upright = upright
+        droll = roll - self.prev_roll
+        dpitch = pitch - self.prev_pitch
+        self.prev_roll, self.prev_pitch = roll, pitch
 
-        upright_reward = self.R["upright"] * (upright ** 2)
-        progress_reward = self.R["progress"] * max(delta_upright, 0)
-        spin_reward = self.R["spin"] * abs(flip_rate) / 10.0 if up_z < 0 else 0.0
-        energy_penalty = self.R["energy"] * abs(throttle)
-        time_penalty = self.R["time"]
+        upright = (u + 1.0) * 0.5
+        ang_motion = abs(droll) + abs(dpitch)
+        R = self.R
 
-        success_bonus = 0.0
-        if up_z > self.upright_threshold and abs(flip_rate) < self.stable_rate_tol:
+        # ===== Reward shaping (pitch-only, integrated time penalty) =====
+        upright_reward = R["upright"] * max(du, 0.0)
+        spin_reward = R["spin"] * abs(dpitch) * (1.0 - upright) if u > -0.8 else 0.0
+        settle_penalty = -R["settle"] * ang_motion if (u > 0.9 and ang_motion > 0.02) else 0.0
+        energy_penalty = -R["energy"] * (throttle ** 2)
+        time_penalty = -R["time"]
+
+        reward = (upright_reward + spin_reward + settle_penalty +
+                  energy_penalty + time_penalty)
+
+        # Success detection
+        if u > 0.96 and ang_motion < 0.01:
             self.hold_counter += 1
             if self.hold_counter >= self.hold_needed:
-                success_bonus = self.R["success"]
+                reward += R["success"]
                 success, done = True, True
         else:
             self.hold_counter = 0
-
-        reward = (upright_reward + progress_reward + spin_reward +
-                  success_bonus + energy_penalty + time_penalty)
-        reward = clip(reward, -10, 200)
 
         self.step_count += 1
         if self.step_count >= self.max_steps:
             done = True
 
+        reward = clip(reward, -10, 150)
         self._render()
         return self._get_obs(), reward, done, {"success": success}
 
     def close(self):
-        if self.render_enabled and self.window is not None:
+        if self._viewer_ready:
             glfw.destroy_window(self.window)
             glfw.terminate()
+            self._viewer_ready = False
 
 
 # ============================================================
@@ -206,11 +195,12 @@ class MonsterTruckFlipEnv:
 # ============================================================
 class QAgent:
     def __init__(self,
-                 obs_bins=(15, 10, 10, 10, 5),
-                 obs_ranges=((-1.0, 1.0), (0, 50), (-120, 120), (-20, 20), (-1, 1)),
-                 n_actions=5,
-                 alpha=0.3, gamma=0.98,
-                 eps_start=0.99, eps_end=0.05, total_episodes=5000):
+                 obs_bins=(20, 15, 15, 9),
+                 obs_ranges=((-1, 1), (-math.pi, math.pi),
+                             (-math.pi / 2, math.pi / 2), (-1, 1)),
+                 n_actions=9,
+                 alpha=0.05, gamma=0.98,
+                 eps_start=0.99, eps_end=0.01, total_episodes=5000):
 
         self.obs_bins = obs_bins
         self.obs_ranges = obs_ranges
@@ -220,7 +210,6 @@ class QAgent:
         self.total_episodes = total_episodes
         self.eps = eps_start
         self.eps_decay = (eps_end / eps_start) ** (1.0 / total_episodes)
-
         self.q = np.zeros(obs_bins + (n_actions,), dtype=np.float32)
         self.bin_edges = [np.linspace(lo, hi, nb - 1)
                           for (lo, hi), nb in zip(obs_ranges, obs_bins)]
@@ -235,36 +224,37 @@ class QAgent:
             return np.random.randint(self.n_actions)
         return int(np.argmax(self.q[s]))
 
-    def learn(self, obs, action, reward, next_obs, done):
+    def act_greedy(self, obs):
+        s = self._disc(obs)
+        return int(np.argmax(self.q[s]))
+
+    def learn(self, obs, a, r, next_obs, done):
         s, sn = self._disc(obs), self._disc(next_obs)
         best_next = 0.0 if done else np.max(self.q[sn])
-        target = reward + self.gamma * best_next
-        self.q[s + (action,)] += self.alpha * (target - self.q[s + (action,)])
+        target = r + self.gamma * best_next
+        self.q[s + (a,)] += self.alpha * (target - self.q[s + (a,)])
 
     def decay_eps(self):
         self.eps = max(self.eps_end, self.eps * self.eps_decay)
 
-    def save(self, path="qtable_monstertruck.npy", meta="qtable_meta.json"):
+    def save(self, path="qtable_ypr.npy", meta="qmeta_ypr.json"):
         np.save(path, self.q)
         with open(meta, "w") as f:
             json.dump({"obs_bins": self.obs_bins, "obs_ranges": self.obs_ranges,
                        "n_actions": self.n_actions}, f, indent=2)
         print(f"💾 Saved Q-table to {path}")
 
-    def load(self, path="qtable_monstertruck.npy", meta="qtable_meta.json"):
-        """Loads saved Q-table and metadata."""
+    def load(self, path="qtable_ypr.npy", meta="qmeta_ypr.json"):
         if not (os.path.exists(path) and os.path.exists(meta)):
-            print("⚠️ No saved Q-table found, starting fresh.")
             return False
         try:
             self.q = np.load(path)
             with open(meta, "r") as f:
-                meta_data = json.load(f)
-            self.obs_bins = tuple(meta_data["obs_bins"])
-            self.obs_ranges = [tuple(r) for r in meta_data["obs_ranges"]]
-            self.n_actions = meta_data["n_actions"]
-            print(f"✅ Loaded Q-table from {path}")
-            print(f"Shape: {self.q.shape}")
+                m = json.load(f)
+            self.obs_bins = tuple(m["obs_bins"])
+            self.obs_ranges = [tuple(r) for r in m["obs_ranges"]]
+            self.n_actions = m["n_actions"]
+            print("✅ Loaded Q-table.")
             return True
         except Exception as e:
             print(f"⚠️ Failed to load Q-table: {e}")
@@ -272,30 +262,47 @@ class QAgent:
 
 
 # ============================================================
-# Training Loop
+# Evaluation helper
 # ============================================================
-def train(episodes=3000, render_every=200, max_steps=2000, save_every=100, load_model=False):
+def evaluate_episode(env, agent, max_steps=1500, render=False):
+    obs = env.reset()
+    total = 0.0
+    success_flag = 0
+    for _ in range(max_steps):
+        a = agent.act_greedy(obs)
+        obs, r, done, info = env.step(a)
+        total += r
+        if done:
+            if info.get("success", False):
+                success_flag = 1
+            break
+    return total, success_flag
+
+
+# ============================================================
+# Training
+# ============================================================
+def train(episodes=3000, render_every=100, max_steps=1500, load_model=False, eval_every=100):
     agent = QAgent(total_episodes=episodes)
+    if load_model and agent.load():
+        print("🔁 Continuing training from saved Q-table")
 
-    # 🔹 Load previous model if available and requested
-    if load_model:
-        loaded = agent.load()
-        if loaded:
-            print("🔁 Continuing training from saved Q-table...")
-        else:
-            print("🚀 Starting new training session (no saved table found).")
-
-    env = None
     successes = 0
+    rewards_list = []
+    success_flags = []
+    eval_ep_indices, eval_rewards = [], []
+
+    env = MonsterTruckFlipEnvYPR(render=False, realtime=False,
+                                 frame_skip=10, max_steps=max_steps)
 
     for ep in range(1, episodes + 1):
-        if env:
-            env.close()
         do_render = (render_every and ep % render_every == 0)
-        env = MonsterTruckFlipEnv(render=do_render, frame_skip=10, max_steps=max_steps, realtime=True)
+        env.render_enabled = do_render
+        env.realtime = do_render
 
         obs = env.reset()
         ep_ret = 0.0
+        success_flag = 0
 
         for _ in range(max_steps):
             a = agent.act(obs)
@@ -305,21 +312,52 @@ def train(episodes=3000, render_every=200, max_steps=2000, save_every=100, load_
             ep_ret += r
             if done:
                 if info.get("success", False):
+                    success_flag = 1
                     successes += 1
                 break
 
+        rewards_list.append(ep_ret)
+        success_flags.append(success_flag)
         agent.decay_eps()
-        if ep % 10 == 0:
-            print(f"Ep {ep:4d} | Ret {ep_ret:7.2f} | eps {agent.eps:5.3f} | success {successes}")
 
-        if save_every and ep % save_every == 0:
-            agent.save()
+        if ep % 10 == 0:
+            recent_rewards = rewards_list[-10:]
+            recent_success = sum(success_flags[-10:])
+            print(f"Ep {ep:4d} | eps {agent.eps:5.3f} | total success {successes}")
+            print(f"   Last 10 rewards: {[round(r, 2) for r in recent_rewards]}")
+            print(f"   Success (last 10): {recent_success}/10")
+
+        if eval_every and (ep % eval_every == 0):
+            er, es = evaluate_episode(env, agent, max_steps=max_steps, render=False)
+            eval_ep_indices.append(ep)
+            eval_rewards.append(er)
+            print(f"   [Eval @ Ep {ep}] reward={er:.2f} | success={es}")
 
     env.close()
     agent.save()
     print(f"✅ Training complete! Successes: {successes}/{episodes}")
 
+    np.save("training_rewards.npy", np.array(rewards_list, dtype=np.float32))
+    np.save("eval_rewards.npy", np.array(eval_rewards, dtype=np.float32))
+    np.save("eval_episodes.npy", np.array(eval_ep_indices, dtype=np.int32))
+
+    if len(eval_ep_indices) > 0:
+        plt.figure(figsize=(8, 4.8))
+        plt.plot(eval_ep_indices, eval_rewards, marker='o', color='blue')
+        plt.xlabel("Episode")
+        plt.ylabel("Evaluation Reward")
+        plt.title("Evaluation Reward vs Episode (Pitch-Only Spin, Integrated Time Penalty)")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig("eval_rewards.png", dpi=150)
+        print("📈 Saved evaluation plot to eval_rewards.png")
+
+    return rewards_list, (eval_ep_indices, eval_rewards)
+
 
 if __name__ == "__main__":
-    # 🔹 Set load_model=True to resume training from existing Q-table
-    train(episodes=3000, render_every=200, max_steps=2000, save_every=100, load_model=True)
+    rewards, (eval_eps, eval_rewards) = train(
+        episodes=8000, render_every=500, max_steps=1500,
+        load_model=False, eval_every=100
+    )
+    print("💾 Saved all episode rewards to training_rewards.npy")

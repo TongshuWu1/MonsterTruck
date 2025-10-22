@@ -62,7 +62,7 @@
 
   <!-- Rear-wheel motors for throttle -->
   <actuator>
-    <motor name="rear_left_motor" joint="j_rl" gear="280"/>
-    <motor name="rear_right_motor" joint="j_rr" gear="280"/>
+    <motor name="rear_left_motor" joint="j_rl" gear="350"/>
+    <motor name="rear_right_motor" joint="j_rr" gear="350"/>
   </actuator>
 </mujoco>
