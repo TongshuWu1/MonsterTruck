@@ -1,5 +1,6 @@
 # ===============================================================
-# TileQLearning_Monstertruck_YPR_standalone.py (Eval Every 50)
+# TileQLearning_Monstertruck_YPR_standalone.py
+# Instantaneous Angular Velocity Reward (No "Best Angle" Tracking)
 # ===============================================================
 
 import os, math, json, time
@@ -27,7 +28,7 @@ def quat_to_rp(q):
 
 
 # ===============================================================
-# Environment (same reward & success logic as YPR)
+# Environment — instantaneous angular velocity shaping
 # ===============================================================
 class MonsterTruckFlipEnvYPR:
     def __init__(self, xml_path="monstertruck.xml",
@@ -51,22 +52,19 @@ class MonsterTruckFlipEnvYPR:
 
         self.body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "chassis")
 
+        # Reward weights
         self.R = dict(
-            upright=20.0,
-            spin=1,
-            settle=0.5,
-            energy=0.01,
-            time=0.035,
-            success=800.0,
+            angvel=5.0,     # weight for angular velocity shaping
+            energy=0.02,    # energy cost
+            time=0.05,      # time penalty
+            success=800.0,  # success bonus
         )
-
-        self.prev_upright = 0.0
-        self.prev_roll, self.prev_pitch = 0.0, 0.0
 
         self._viewer_ready = False
         if render:
             self._init_viewer()
 
+    # -----------------------------------------------------------
     def _init_viewer(self):
         if self._viewer_ready:
             return
@@ -81,6 +79,7 @@ class MonsterTruckFlipEnvYPR:
         self.cam.distance, self.cam.azimuth, self.cam.elevation = 3.0, 90, -25
         self._viewer_ready = True
 
+    # -----------------------------------------------------------
     def _render(self):
         if not self.render_enabled:
             return
@@ -101,6 +100,7 @@ class MonsterTruckFlipEnvYPR:
         glfw.swap_buffers(self.window)
         glfw.poll_events()
 
+    # -----------------------------------------------------------
     def reset(self):
         mujoco.mj_resetData(self.model, self.data)
         self.data.qpos[:3] = np.array([0, 0, 0.6]) + 0.02 * np.random.randn(3)
@@ -111,10 +111,9 @@ class MonsterTruckFlipEnvYPR:
         self.step_count = 0
         self.last_throttle = 0.0
         self.hold_counter = 0
-        self.prev_upright = -1.0
-        self.prev_roll, self.prev_pitch = 0.0, 0.0
         return self._get_obs()
 
+    # -----------------------------------------------------------
     def _get_rp(self):
         q = np.copy(self.data.qpos[3:7])
         return quat_to_rp(q)
@@ -124,6 +123,7 @@ class MonsterTruckFlipEnvYPR:
         u = math.cos(roll) * math.cos(pitch)
         return np.array([u, roll, pitch, self.last_throttle], dtype=np.float32)
 
+    # -----------------------------------------------------------
     def step(self, a_idx):
         throttle = float(self.actions[a_idx])
         self.last_throttle = throttle
@@ -137,31 +137,24 @@ class MonsterTruckFlipEnvYPR:
             if self.realtime:
                 time.sleep(self.dt)
 
+        # --- Roll + Angular Velocity ---
         roll, pitch = self._get_rp()
-        u = math.cos(roll) * math.cos(pitch)
-        du = u - self.prev_upright
-        self.prev_upright = u
+        roll_deg = np.degrees((roll + 2*np.pi) % (2*np.pi))
+        roll_rate = float(self.data.xvelr[self.body_id][0])  # roll angular velocity (rad/s)
 
-        droll = roll - self.prev_roll
-        dpitch = pitch - self.prev_pitch
-        self.prev_roll, self.prev_pitch = roll, pitch
+        # --- Angle-scaled reward (no history / progress) ---
+        scale = (180 - roll_deg) / 180.0  # 1 at 180°, 0 at 0°, negative beyond
+        scale = clip(scale, -1.0, 1.0)
+        R_ang = self.R["angvel"] * (-roll_rate) * scale
 
-        upright = (u + 1.0) * 0.5
-        ang_motion = abs(droll) + abs(dpitch)
-        R = self.R
+        # --- Combine with simple penalties ---
+        reward = R_ang - self.R["energy"] * (throttle ** 2) - self.R["time"]
 
-        upright_reward = R["upright"] * max(du, 0.0)
-        spin_reward = R["spin"] * abs(dpitch) * (1.0 - upright) if u > -0.8 else 0.0
-        settle_penalty = -R["settle"] * ang_motion if (u > 0.9 and ang_motion > 0.02) else 0.0
-        energy_penalty = -R["energy"] * (throttle ** 2)
-        time_penalty = -R["time"]
-
-        reward = upright_reward + spin_reward + settle_penalty + energy_penalty + time_penalty
-
-        if u > 0.96 and ang_motion < 0.01:
+        # --- Success condition (upright within ±10°) ---
+        if roll_deg < 10 or roll_deg > 350:
             self.hold_counter += 1
             if self.hold_counter >= self.hold_needed:
-                reward += R["success"]
+                reward += self.R["success"]
                 success, done = True, True
         else:
             self.hold_counter = 0
@@ -170,10 +163,11 @@ class MonsterTruckFlipEnvYPR:
         if self.step_count >= self.max_steps:
             done = True
 
-        reward = clip(reward, -10, 150)
+        reward = clip(reward, -50, 150)
         self._render()
         return self._get_obs(), reward, done, {"success": success}
 
+    # -----------------------------------------------------------
     def close(self):
         if self._viewer_ready:
             glfw.destroy_window(self.window)
@@ -191,7 +185,6 @@ class TileCoder:
         self.n_tiles = np.array(n_tiles, dtype=np.int32)
         self.n_tilings = int(n_tilings)
         self.dim = len(lows)
-
         rng = np.random.default_rng(seed)
         self.offsets = rng.uniform(0, 1, (self.n_tilings, self.dim)) / self.n_tiles
 
@@ -199,7 +192,6 @@ class TileCoder:
         s = np.array(s, dtype=np.float32)
         ratios = (s - self.lows) / (self.highs - self.lows + 1e-8)
         ratios = np.clip(ratios, 0, 0.999999)
-
         indices = []
         for t in range(self.n_tilings):
             shifted = (ratios + self.offsets[t]) * self.n_tiles
@@ -279,23 +271,19 @@ def evaluate_episode(env, agent, max_steps=1500):
     return total, success_flag
 
 
-def train_tileq(episodes=3000, render_every=100, max_steps=1500, load_model=False, eval_every=50):
+def train_tileq(episodes=3000, render_every=100, max_steps=1500, eval_every=50):
     env = MonsterTruckFlipEnvYPR(render=False, realtime=False, frame_skip=10, max_steps=max_steps)
-
     lows  = [-1.0, -math.pi, -math.pi/2, -1.0]
     highs = [ 1.0,  math.pi,  math.pi/2,  1.0]
-
     agent = TileQAgent(lows, highs, total_episodes=episodes)
 
-    rewards_list, success_flags = [], []
-    eval_ep_indices, eval_rewards = [], []
-
+    rewards_list, success_flags, eval_ep_indices, eval_rewards = [], [], [], []
     successes = 0
 
     for ep in range(1, episodes + 1):
-        do_render = (render_every and ep % render_every == 0)
-        env.render_enabled = do_render
-        env.realtime = do_render
+        render = (render_every and ep % render_every == 0)
+        env.render_enabled = render
+        env.realtime = render
 
         obs = env.reset()
         ep_ret, success_flag = 0.0, 0
@@ -317,44 +305,35 @@ def train_tileq(episodes=3000, render_every=100, max_steps=1500, load_model=Fals
         agent.decay_eps()
 
         if ep % 10 == 0:
-            recent_rewards = rewards_list[-10:]
-            recent_success = sum(success_flags[-10:])
-            print(f"Ep {ep:4d} | eps {agent.eps:5.3f} | total success {successes}")
-            print(f"   Last 10 rewards: {[round(r, 2) for r in recent_rewards]}")
-            print(f"   Success (last 10): {recent_success}/10")
+            last10 = rewards_list[-10:]
+            print(f"Ep {ep:4d} | eps {agent.eps:5.3f} | success {successes}")
+            print(f"   Last 10 rewards: {[round(r, 2) for r in last10]}  ({sum(success_flags[-10:])}/10 success)")
 
-        # === Evaluation every 50 episodes (5 runs each) ===
         if eval_every and (ep % eval_every == 0):
             eval_rs, eval_ss = [], []
             for _ in range(5):
                 er, es = evaluate_episode(env, agent, max_steps)
                 eval_rs.append(er)
                 eval_ss.append(es)
-            mean_r = np.mean(eval_rs)
-            succ_rate = np.mean(eval_ss) * 100
+            mean_r, succ_rate = np.mean(eval_rs), np.mean(eval_ss) * 100
             eval_ep_indices.append(ep)
             eval_rewards.append(mean_r)
             print(f"   [Eval @ Ep {ep}] avg_reward={mean_r:.1f} | success_rate={succ_rate:.1f}%")
 
     env.close()
 
-    # === Improved Evaluation Plot ===
     if len(eval_ep_indices) > 0:
         plt.style.use('seaborn-v0_8-bright')
         window = 5
         smoothed = np.convolve(eval_rewards, np.ones(window)/window, mode='valid')
-
         plt.figure(figsize=(9, 5))
         plt.plot(eval_ep_indices, eval_rewards, 'o--', alpha=0.4, label='Raw eval reward')
         plt.plot(eval_ep_indices[window-1:], smoothed, 'r-', linewidth=2.2, label=f'{window}-pt Moving Avg')
-        plt.xlabel("Episode", fontsize=12)
-        plt.ylabel("Evaluation Reward", fontsize=12)
-        plt.title("TileQ Evaluation — Smoothed Performance Over Training", fontsize=13, pad=10)
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.savefig("tileq_eval_rewards_smooth.png", dpi=200)
-        print("📈 Saved smooth evaluation plot to tileq_eval_rewards_smooth.png")
+        plt.xlabel("Episode"); plt.ylabel("Evaluation Reward")
+        plt.title("TileQ — Instantaneous Angular Velocity Shaping")
+        plt.legend(); plt.grid(True, alpha=0.3)
+        plt.tight_layout(); plt.savefig("tileq_eval_rewards_angvel_instant.png", dpi=200)
+        print("📈 Saved eval plot to tileq_eval_rewards_angvel_instant.png")
 
     return rewards_list, (eval_ep_indices, eval_rewards)
 
@@ -364,6 +343,5 @@ def train_tileq(episodes=3000, render_every=100, max_steps=1500, load_model=Fals
 # ===============================================================
 if __name__ == "__main__":
     rewards, (eval_eps, eval_rewards) = train_tileq(
-        episodes=2000, render_every=500, max_steps=1500,
-        load_model=False, eval_every=50
+        episodes=2000, render_every=500, max_steps=1500, eval_every=50
     )
