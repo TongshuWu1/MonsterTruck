@@ -1,26 +1,34 @@
 # ===============================================================
-# TileQLearning_Monstertruck_YPR_standalone.py
-# Instantaneous Angular Velocity Reward (No "Best Angle" Tracking)
+# TileQLearning_Monstertruck.py
+# ===============================================================
+# Tile-coded Q-learning for the MonsterTruck flip environment
+# ---------------------------------------------------------------
+# State: [roll, roll_rate, last_throttle]
+# Action: discrete throttle (-1.0 to 1.0)
+# Reward:
+#   + Linear angular velocity reward (max upside-down, decays near upright)
+#   - Linear angle penalty (further from upright = more negative)
+#   - Jerk and energy/time penalties
+# Success:
+#   - When upright (<3° or >357°) and roll_rate ≈ 0
 # ===============================================================
 
-import os, math, json, time
+import os, math, time
 import numpy as np
 import matplotlib.pyplot as plt
 import mujoco
 from mujoco.glfw import glfw
 
 
-# ------------------------- small utils -------------------------
-def clip(v, lo, hi):
-    return lo if v < lo else (hi if v > hi else v)
-
+# ===============================================================
+# Utility: Quaternion → roll (radians)
+# ===============================================================
 def quat_to_rp(q):
-    """Quaternion -> (roll, pitch)."""
+    """Convert quaternion to (roll, pitch)"""
     w, x, y, z = q
     t0 = +2.0 * (w * x + y * z)
     t1 = +1.0 - 2.0 * (x * x + y * y)
     roll = math.atan2(t0, t1)
-
     t2 = +2.0 * (w * y - z * x)
     t2 = +1.0 if t2 > +1.0 else (-1.0 if t2 < -1.0 else t2)
     pitch = math.asin(t2)
@@ -28,7 +36,7 @@ def quat_to_rp(q):
 
 
 # ===============================================================
-# Environment — instantaneous angular velocity shaping
+# MonsterTruck Flip Environment
 # ===============================================================
 class MonsterTruckFlipEnvYPR:
     def __init__(self, xml_path="monstertruck.xml",
@@ -47,30 +55,29 @@ class MonsterTruckFlipEnvYPR:
         self.actions = np.linspace(-1.0, 1.0, 9)
         self.last_throttle = 0.0
         self.step_count = 0
-        self.hold_counter = 0
-        self.hold_needed = 4
-
         self.body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "chassis")
 
         # Reward weights
         self.R = dict(
-            angvel=5.0,     # weight for angular velocity shaping
-            energy=0.02,    # energy cost
-            time=0.05,      # time penalty
-            success=800.0,  # success bonus
+            angvel=8.0,
+            angle=1.0,
+            energy=0.2,
+            jerk=0.2,
+            time=0.4,
+            success=800.0,
         )
 
         self._viewer_ready = False
         if render:
             self._init_viewer()
 
-    # -----------------------------------------------------------
+    # ---------------------- Rendering ----------------------
     def _init_viewer(self):
         if self._viewer_ready:
             return
         if not glfw.init():
             raise RuntimeError("GLFW init failed")
-        self.window = glfw.create_window(1000, 800, "MonsterTruck YPR Flip", None, None)
+        self.window = glfw.create_window(1000, 800, "MonsterTruck Flip", None, None)
         glfw.make_context_current(self.window)
         self.cam = mujoco.MjvCamera()
         self.opt = mujoco.MjvOption()
@@ -79,7 +86,6 @@ class MonsterTruckFlipEnvYPR:
         self.cam.distance, self.cam.azimuth, self.cam.elevation = 3.0, 90, -25
         self._viewer_ready = True
 
-    # -----------------------------------------------------------
     def _render(self):
         if not self.render_enabled:
             return
@@ -91,7 +97,6 @@ class MonsterTruckFlipEnvYPR:
             self._viewer_ready = False
             self.render_enabled = False
             return
-
         self.cam.lookat[:] = self.data.xpos[self.body_id]
         mujoco.mjv_updateScene(self.model, self.data, self.opt, None, self.cam,
                                mujoco.mjtCatBit.mjCAT_ALL, self.scene)
@@ -100,33 +105,28 @@ class MonsterTruckFlipEnvYPR:
         glfw.swap_buffers(self.window)
         glfw.poll_events()
 
-    # -----------------------------------------------------------
+    # ---------------------- Core API ----------------------
     def reset(self):
         mujoco.mj_resetData(self.model, self.data)
         self.data.qpos[:3] = np.array([0, 0, 0.6]) + 0.02 * np.random.randn(3)
         self.data.qvel[:] = 0.0
-        self.data.qpos[3:7] = np.array([0, 1, 0, 0])  # upside-down start
+        self.data.qpos[3:7] = np.array([0, 1, 0, 0])  # upside-down
         mujoco.mj_forward(self.model, self.data)
-
         self.step_count = 0
         self.last_throttle = 0.0
-        self.hold_counter = 0
         return self._get_obs()
 
-    # -----------------------------------------------------------
     def _get_rp(self):
         q = np.copy(self.data.qpos[3:7])
         return quat_to_rp(q)
 
     def _get_obs(self):
-        roll, pitch = self._get_rp()
-        u = math.cos(roll) * math.cos(pitch)
-        return np.array([u, roll, pitch, self.last_throttle], dtype=np.float32)
+        roll, _ = self._get_rp()
+        roll_rate = float(self.data.cvel[self.body_id][3])
+        return np.array([roll, roll_rate, self.last_throttle], dtype=np.float32)
 
-    # -----------------------------------------------------------
     def step(self, a_idx):
         throttle = float(self.actions[a_idx])
-        self.last_throttle = throttle
         done, success = False, False
 
         for _ in range(self.frame_skip):
@@ -137,37 +137,37 @@ class MonsterTruckFlipEnvYPR:
             if self.realtime:
                 time.sleep(self.dt)
 
-        # --- Roll + Angular Velocity ---
-        roll, pitch = self._get_rp()
-        roll_deg = np.degrees((roll + 2*np.pi) % (2*np.pi))
-        roll_rate = float(self.data.xvelr[self.body_id][0])  # roll angular velocity (rad/s)
+        roll, _ = self._get_rp()
+        roll_deg = np.degrees((roll + 2 * np.pi) % (2 * np.pi))
+        roll_rate = float(self.data.cvel[self.body_id][3])
 
-        # --- Angle-scaled reward (no history / progress) ---
-        scale = (180 - roll_deg) / 180.0  # 1 at 180°, 0 at 0°, negative beyond
-        scale = clip(scale, -1.0, 1.0)
-        R_ang = self.R["angvel"] * (-roll_rate) * scale
+        # --- Linear angular velocity reward ---
+        scale = 1 - abs(180 - roll_deg) / 180.0
+        R_angvel = self.R["angvel"] * abs(roll_rate) * scale
 
-        # --- Combine with simple penalties ---
-        reward = R_ang - self.R["energy"] * (throttle ** 2) - self.R["time"]
+        # --- Linear angle penalty ---
+        R_angle = -self.R["angle"] * (roll_deg / 360.0)
 
-        # --- Success condition (upright within ±10°) ---
-        if roll_deg < 10 or roll_deg > 350:
-            self.hold_counter += 1
-            if self.hold_counter >= self.hold_needed:
-                reward += self.R["success"]
-                success, done = True, True
-        else:
-            self.hold_counter = 0
+        # --- Jerk penalty ---
+        jerk = throttle - self.last_throttle
+        R_jerk = -self.R["jerk"] * (jerk ** 2)
 
+        # --- Total reward ---
+        reward = R_angvel + R_angle + R_jerk - self.R["energy"] * (throttle ** 2) - self.R["time"]
+
+        # --- Success detection ---
+        if (roll_deg < 3 or roll_deg > 357) and abs(roll_rate) < 0.05:
+            reward += self.R["success"]
+            success, done = True, True
+
+        self.last_throttle = throttle
         self.step_count += 1
         if self.step_count >= self.max_steps:
             done = True
 
-        reward = clip(reward, -50, 150)
         self._render()
         return self._get_obs(), reward, done, {"success": success}
 
-    # -----------------------------------------------------------
     def close(self):
         if self._viewer_ready:
             glfw.destroy_window(self.window)
@@ -176,7 +176,7 @@ class MonsterTruckFlipEnvYPR:
 
 
 # ===============================================================
-# Tile Coder (CMAC)
+# Tile Coder + Agent (Exponential ε-decay)
 # ===============================================================
 class TileCoder:
     def __init__(self, lows, highs, n_tiles, n_tilings, seed=0):
@@ -192,39 +192,39 @@ class TileCoder:
         s = np.array(s, dtype=np.float32)
         ratios = (s - self.lows) / (self.highs - self.lows + 1e-8)
         ratios = np.clip(ratios, 0, 0.999999)
-        indices = []
+        idxs = []
         for t in range(self.n_tilings):
             shifted = (ratios + self.offsets[t]) * self.n_tiles
             tile_coords = np.floor(shifted).astype(int)
-            flat_idx = np.ravel_multi_index(tile_coords, self.n_tiles, mode='clip')
-            indices.append(t * int(np.prod(self.n_tiles)) + flat_idx)
-        return indices
+            flat = np.ravel_multi_index(tile_coords, self.n_tiles, mode='clip')
+            idxs.append(t * int(np.prod(self.n_tiles)) + flat)
+        return idxs
 
     @property
     def total_tiles(self):
         return self.n_tilings * int(np.prod(self.n_tiles))
 
 
-# ===============================================================
-# Tile-coded Q-learning Agent
-# ===============================================================
 class TileQAgent:
     def __init__(self, obs_low, obs_high,
-                 n_tiles=(6, 6, 12, 6), n_tilings=8,
+                 n_tiles=(18, 12, 6), n_tilings=8,
                  n_actions=9, alpha=0.05, gamma=0.98,
                  eps_start=0.99, eps_end=0.01, total_episodes=5000):
-
         self.gamma = gamma
         self.alpha = alpha / float(n_tilings)
         self.eps_start, self.eps_end = eps_start, eps_end
         self.total_episodes = total_episodes
-        self.eps = eps_start
-        self.eps_decay = (eps_end / eps_start) ** (1.0 / total_episodes)
         self.n_actions = n_actions
-
         self.tc = TileCoder(obs_low, obs_high, n_tiles, n_tilings)
         self.n_features = self.tc.total_tiles
         self.w = np.zeros((n_actions, self.n_features), dtype=np.float32)
+        self.current_episode = 0
+        self.eps = eps_start
+
+    def update_epsilon(self):
+        frac = min(1.0, self.current_episode / self.total_episodes)
+        decay_rate = 2.0
+        self.eps = self.eps_end + (self.eps_start - self.eps_end) * np.exp(-decay_rate * frac)
 
     def _qvalue(self, obs, a):
         idxs = self.tc.encode(obs)
@@ -250,13 +250,18 @@ class TileQAgent:
             self.w[a, idx] += self.alpha * delta
 
     def decay_eps(self):
-        self.eps = max(self.eps_end, self.eps * self.eps_decay)
+        self.current_episode += 1
+        self.update_epsilon()
 
 
 # ===============================================================
 # Evaluation + Training
 # ===============================================================
 def evaluate_episode(env, agent, max_steps=1500):
+    # Force no rendering during evaluation
+    env.render_enabled = False
+    env.realtime = False
+
     obs = env.reset()
     total = 0.0
     success_flag = 0
@@ -271,16 +276,17 @@ def evaluate_episode(env, agent, max_steps=1500):
     return total, success_flag
 
 
-def train_tileq(episodes=3000, render_every=100, max_steps=1500, eval_every=50):
-    env = MonsterTruckFlipEnvYPR(render=False, realtime=False, frame_skip=10, max_steps=max_steps)
-    lows  = [-1.0, -math.pi, -math.pi/2, -1.0]
-    highs = [ 1.0,  math.pi,  math.pi/2,  1.0]
-    agent = TileQAgent(lows, highs, total_episodes=episodes)
+def train_tileq(episodes=2000, render_every=100, max_steps=1500, eval_every=50):
+    env = MonsterTruckFlipEnvYPR(render=False, realtime=False, frame_skip=5, max_steps=max_steps)
+    lows, highs = [-math.pi, -20.0, -1.0], [math.pi, 20.0, 1.0]
+    agent = TileQAgent(lows, highs, n_tiles=(18, 12, 6), n_tilings=8,
+                       n_actions=len(env.actions), total_episodes=episodes)
 
     rewards_list, success_flags, eval_ep_indices, eval_rewards = [], [], [], []
     successes = 0
 
     for ep in range(1, episodes + 1):
+        # Render only one episode after render_every
         render = (render_every and ep % render_every == 0)
         env.render_enabled = render
         env.realtime = render
@@ -300,13 +306,18 @@ def train_tileq(episodes=3000, render_every=100, max_steps=1500, eval_every=50):
                     successes += 1
                 break
 
+        # Turn rendering off after one episode
+        if render:
+            env.render_enabled = False
+            env.realtime = False
+
         rewards_list.append(ep_ret)
         success_flags.append(success_flag)
         agent.decay_eps()
 
         if ep % 10 == 0:
             last10 = rewards_list[-10:]
-            print(f"Ep {ep:4d} | eps {agent.eps:5.3f} | success {successes}")
+            print(f"Ep {ep:4d} | eps {agent.eps:5.3f} | successes {successes}")
             print(f"   Last 10 rewards: {[round(r, 2) for r in last10]}  ({sum(success_flags[-10:])}/10 success)")
 
         if eval_every and (ep % eval_every == 0):
@@ -315,7 +326,7 @@ def train_tileq(episodes=3000, render_every=100, max_steps=1500, eval_every=50):
                 er, es = evaluate_episode(env, agent, max_steps)
                 eval_rs.append(er)
                 eval_ss.append(es)
-            mean_r, succ_rate = np.mean(eval_rs), np.mean(eval_ss) * 100
+            mean_r, succ_rate = np.mean(eval_rs), np.mean(eval_ss)*100
             eval_ep_indices.append(ep)
             eval_rewards.append(mean_r)
             print(f"   [Eval @ Ep {ep}] avg_reward={mean_r:.1f} | success_rate={succ_rate:.1f}%")
@@ -326,22 +337,21 @@ def train_tileq(episodes=3000, render_every=100, max_steps=1500, eval_every=50):
         plt.style.use('seaborn-v0_8-bright')
         window = 5
         smoothed = np.convolve(eval_rewards, np.ones(window)/window, mode='valid')
-        plt.figure(figsize=(9, 5))
-        plt.plot(eval_ep_indices, eval_rewards, 'o--', alpha=0.4, label='Raw eval reward')
-        plt.plot(eval_ep_indices[window-1:], smoothed, 'r-', linewidth=2.2, label=f'{window}-pt Moving Avg')
-        plt.xlabel("Episode"); plt.ylabel("Evaluation Reward")
-        plt.title("TileQ — Instantaneous Angular Velocity Shaping")
-        plt.legend(); plt.grid(True, alpha=0.3)
-        plt.tight_layout(); plt.savefig("tileq_eval_rewards_angvel_instant.png", dpi=200)
-        print("📈 Saved eval plot to tileq_eval_rewards_angvel_instant.png")
+        plt.figure(figsize=(9,5))
+        plt.plot(eval_ep_indices, eval_rewards, 'o--', alpha=0.45, label='Raw eval reward')
+        if len(smoothed) > 0:
+            plt.plot(eval_ep_indices[window-1:], smoothed, 'r-', lw=2.2, label=f'{window}-pt Moving Avg')
+        plt.xlabel("Episode")
+        plt.ylabel("Evaluation Reward")
+        plt.title("TileQ — Exponential ε-decay")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig("tileq_eval_rewards_exponential_eps.png", dpi=200)
+        print("📈 Saved eval plot to tileq_eval_rewards_exponential_eps.png")
 
     return rewards_list, (eval_ep_indices, eval_rewards)
 
 
-# ===============================================================
-# Run training
-# ===============================================================
 if __name__ == "__main__":
-    rewards, (eval_eps, eval_rewards) = train_tileq(
-        episodes=2000, render_every=500, max_steps=1500, eval_every=50
-    )
+    train_tileq(episodes=2000, render_every=500, max_steps=1500, eval_every=50)
