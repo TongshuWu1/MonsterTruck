@@ -461,6 +461,6 @@ if __name__ == "__main__":
         save_every=100,
         seed=0,
         device="cuda",          # set "cpu" to force CPU
-        xml_path="monstertruck.xml",
+        xml_path="../tile_q/monstertruck.xml",
         do_eval_render=False
     )
