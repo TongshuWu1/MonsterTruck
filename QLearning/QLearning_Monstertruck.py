@@ -357,7 +357,7 @@ def train(episodes=3000, render_every=100, max_steps=1500, load_model=False, eva
 
 if __name__ == "__main__":
     rewards, (eval_eps, eval_rewards) = train(
-        episodes=8000, render_every=500, max_steps=1500,
-        load_model=False, eval_every=100
+        episodes=4000, render_every=4000, max_steps=1500,
+        load_model=False, eval_every=50
     )
     print("💾 Saved all episode rewards to training_rewards.npy")
