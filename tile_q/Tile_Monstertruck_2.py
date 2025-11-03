@@ -1,6 +1,7 @@
 # ===============================================================
 # TileQLearning_Monstertruck_YPR.py
 # Pitch-based flipping (roll & pitch uprightness, pitch-only motion)
+# MountainCar-style tanh² distance penalty + adaptive velocity shaping
 # ===============================================================
 
 import os, math, time, json
@@ -29,7 +30,7 @@ def clip(v, lo, hi):
 
 
 # ===============================================================
-# MonsterTruck Flip Environment (pitch-based)
+# MonsterTruck Flip Environment (MountainCar-style shaping)
 # ===============================================================
 class MonsterTruckFlipEnvYPR:
     def __init__(self, xml_path="monstertruck.xml",
@@ -54,14 +55,22 @@ class MonsterTruckFlipEnvYPR:
 
         self.body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "chassis")
 
-        # Reward weights (same logic as QLearning_Monstertruck_YPR)
+        # self.R = dict(
+        #     position=1.0,    # distance penalty
+        #     velocity=30.0,    # progress reward (du/dt)
+        #     stop_boost=0.2,  # damping near upright (−ω²)
+        #     energy=0.1,      # control effort penalty
+        #     time=0.5,        # constant per-step time cost
+        #     success=1000.0    # terminal bonus
+        # )
+
         self.R = dict(
-            upright=20.0,
-            spin=1.0,
-            settle=0.3,
-            energy=0.01,
-            time=0.05,
-            success=100.0,
+            position=0.8,    # distance penalty
+            velocity=20.0,    # progress reward (du/dt)
+            stop_boost=0.2,  # damping near upright (−ω²)
+            energy=0.1,      # control effort penalty
+            time=0.3,        # constant per-step time cost
+            success=800.0    # terminal bonus
         )
 
         self.prev_upright = -1.0
@@ -107,7 +116,7 @@ class MonsterTruckFlipEnvYPR:
     # ---------------- Core API ----------------
     def reset(self):
         mujoco.mj_resetData(self.model, self.data)
-        self.data.qpos[:3] = np.array([0, 0, 0.6])
+        self.data.qpos[:3] = np.array([0, 0, 0.2])
         self.data.qvel[:] = 0.0
         self.data.qpos[3:7] = np.array([0, 1, 0, 0])  # upside-down start
         mujoco.mj_forward(self.model, self.data)
@@ -132,6 +141,7 @@ class MonsterTruckFlipEnvYPR:
         self.last_throttle = throttle
         done, success = False, False
 
+        # Apply control
         for _ in range(self.frame_skip):
             for i in range(min(2, self.model.nu)):
                 self.data.ctrl[i] = throttle
@@ -139,6 +149,7 @@ class MonsterTruckFlipEnvYPR:
             if self.realtime:
                 time.sleep(self.dt)
 
+        # Orientation and angular motion
         roll, pitch = self._get_rp()
         u = math.cos(roll) * math.cos(pitch)
         du = u - self.prev_upright
@@ -148,20 +159,30 @@ class MonsterTruckFlipEnvYPR:
         dpitch = pitch - self.prev_pitch
         self.prev_roll, self.prev_pitch = roll, pitch
 
-        upright = (u + 1.0) * 0.5
-        ang_motion = abs(droll) + abs(dpitch)
+        horizon_dt = max(self.frame_skip * self.dt, 1e-6)
+        pitch_rate = dpitch / horizon_dt
+
+        # Normalized upright distance (0 = upright, 1 = upside-down)
+        dist_norm = np.clip((1.0 - u) * 0.5, 0.0, 1.0)
+
         R = self.R
 
-        upright_reward = R["upright"] * max(du, 0.0)
-        spin_reward = R["spin"] * abs(dpitch) * (1.0 - upright) if u > -0.8 else 0.0
-        settle_penalty = -R["settle"] * ang_motion if (u > 0.9 and ang_motion > 0.02) else 0.0
-        energy_penalty = -R["energy"] * (throttle ** 2)
-        time_penalty = -R["time"]
+        # --------------------------------------------------------------
+        # MountainCar-like shaping
+        # --------------------------------------------------------------
+        pos_penalty = R["position"] * (np.tanh(3.0 * dist_norm) ** 2)
+        vel_progress = R["velocity"] * du / (horizon_dt + 1e-9)
+        near_upright = np.exp(-12.0 * dist_norm)
+        vel_brake = -R["stop_boost"] * near_upright * (pitch_rate ** 2)
+        energy_penalty = R["energy"] * (throttle ** 2)
+        time_penalty = R["time"]
 
-        reward = (upright_reward + spin_reward + settle_penalty +
-                  energy_penalty + time_penalty)
+        reward = vel_progress - pos_penalty - energy_penalty - time_penalty + vel_brake
+        reward = clip(reward, -50.0, 300.0)
 
-        if u > 0.96 and ang_motion < 0.01:
+        # Success condition
+        ang_motion = abs(droll) + abs(dpitch)
+        if u > 0.96 and abs(pitch_rate) < 0.1 and ang_motion < 0.01:
             self.hold_counter += 1
             if self.hold_counter >= self.hold_needed:
                 reward += R["success"]
@@ -173,9 +194,8 @@ class MonsterTruckFlipEnvYPR:
         if self.step_count >= self.max_steps:
             done = True
 
-        reward = clip(reward, -10, 150)
         self._render()
-        return self._get_obs(), reward, done, {"success": success}
+        return self._get_obs(), float(reward), done, {"success": success}
 
     def close(self):
         if self._viewer_ready:
@@ -185,7 +205,7 @@ class MonsterTruckFlipEnvYPR:
 
 
 # ===============================================================
-# Tile Coder + Agent
+# Tile Coder + Q-learning Agent
 # ===============================================================
 class TileCoder:
     def __init__(self, lows, highs, n_tiles, n_tilings, seed=0):
@@ -289,7 +309,7 @@ def evaluate_episode(env, agent, max_steps=1500):
     return total, success_flag
 
 
-def train_tileq(episodes=2000, max_steps=1500, eval_every=50, num_actions=9):
+def train_tileq(episodes=1000, max_steps=1500, eval_every=50, num_actions=9):
     env = MonsterTruckFlipEnvYPR(render=False, realtime=False,
                                  frame_skip=10, max_steps=max_steps, num_actions=num_actions)
 
@@ -327,11 +347,10 @@ def train_tileq(episodes=2000, max_steps=1500, eval_every=50, num_actions=9):
             print(f"   Last 10 rewards: {[round(r, 2) for r in last10]}  "
                   f"({sum(success_flags[-10:])}/10 success)")
 
-        # --- evaluation block ---
+        # Evaluation block
         if eval_every and (ep % eval_every == 0):
             eval_rs, eval_ss = [], []
             for i in range(3):
-                # render only for the first eval episode
                 env.render_enabled = (i == 0)
                 env.realtime = (i == 0)
                 er, es = evaluate_episode(env, agent, env.max_steps)
@@ -356,7 +375,7 @@ def train_tileq(episodes=2000, max_steps=1500, eval_every=50, num_actions=9):
             plt.plot(eval_ep_indices[window-1:], smoothed, 'r-', lw=2.2, label=f'{window}-pt Moving Avg')
         plt.xlabel("Episode")
         plt.ylabel("Evaluation Reward")
-        plt.title("TileQ — Pitch-based uprightness & spin reward")
+        plt.title("TileQ — Pitch-based flipping with velocity shaping")
         plt.legend()
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
@@ -368,4 +387,4 @@ def train_tileq(episodes=2000, max_steps=1500, eval_every=50, num_actions=9):
 
 
 if __name__ == "__main__":
-    train_tileq(episodes=600, max_steps=1500, eval_every=50, num_actions=9)
+    train_tileq(episodes=1000, max_steps=1500, eval_every=50, num_actions=9)
