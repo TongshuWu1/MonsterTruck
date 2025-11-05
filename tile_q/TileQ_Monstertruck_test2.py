@@ -1,11 +1,18 @@
 # ===============================================================
-# TileQLearning_Monstertruck_Pitch_RAW.py  (ANGLES IN DEGREES)
-# θ_raw-only shaping (no Euler terms, no progress term):
-#   - θ_raw: 0° = upside-down, 180° = upright
-#   - ω:     deg/s over frame_skip horizon (converted to rad/s for penalties)
+# TileQLearning_Monstertruck_Pitch_SIGNED_FORWARD.py  (DEGREES)
+# Signed flip angle φ:
+#   φ ∈ [-180°, +180°]: 0° = upside-down, +180° = forward upright, -180° = backward upright
+#   ω: deg/s over frame_skip horizon (converted to rad/s for penalties)
+#
+# Forward-goal shaping (MountainCar-style):
+#   - Directional distance-to-goal (forward): d_fwd = (180 - φ)/180 ∈ [0, 2]
+#       * φ = 0°  -> d_fwd = 1
+#       * φ = -30 -> d_fwd = 210/180 > 1  (penalize "going backward")
+#       * φ = +180 -> d_fwd = 0 (goal)
+#   - Momentum reward uses |ω| when far (allows rocking), brake near goal
 #
 # Reward:
-#   r = - position(θ_raw) + momentum(|ω|, far) - near_upright_brake(ω^2)
+#   r = - position(d_fwd) + momentum(|ω|, far(d_fwd)) - near_upright_brake(ω^2, near(d_fwd))
 #       - energy(u^2) - time - jerk(|Δu|)
 #
 # Includes cumulative reward plot + greedy trace plots.
@@ -23,9 +30,9 @@ def clip(v, lo, hi):
 
 
 # ===============================================================
-# MonsterTruck Flip Environment (Raw Pitch + Pitch Rate, θ_raw-only)
+# Environment (Signed φ + forward-goal distance)
 # ===============================================================
-class MonsterTruckFlipEnvPitchRaw:
+class MonsterTruckFlipEnvPitchSigned:
     def __init__(self, xml_path="monstertruck.xml",
                  frame_skip=10, max_steps=2000,
                  render=False, realtime=False,
@@ -48,20 +55,21 @@ class MonsterTruckFlipEnvPitchRaw:
 
         self.body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "chassis")
 
-        # Reward weights (θ_raw-only)
+        # Reward weights
         self.R = dict(
-            position=1.8,     # distance penalty using θ_raw only
-            momentum=3.0,    # MountainCar-style momentum reward (|ω| when far)
-            stop_boost=0.01,  # near-upright brake on ω^2 (θ_raw gate)
-            energy=0.1,      # control effort penalty
-            time=1.0,        # small per-step time cost
-            jerk=0.1,        # |Δu|
-            success=1500.0     # terminal bonus
+            position=2.5,     # directional distance penalty via d_fwd
+            momentum=1.5,    # MountainCar-style momentum reward (|ω| when far)
+            stop_boost=0.02,  # near-upright brake on ω^2
+            energy=0.05,      # control effort penalty
+            time=0.10,        # per-step time cost
+            jerk=0.02,        # |Δu|
+            success=500.0     # terminal bonus
         )
 
         # State memory
-        self.prev_pitch_deg = 0.0
-        self.last_rate_deg = 0.0  # populated each step
+        self.prev_phi_deg = 0.0
+        self.last_rate_deg = 0.0
+        self._flip_sign = 0.0  # +1 forward, -1 backward; resolved after slight motion
 
         # Viewer
         self._viewer_ready = False
@@ -74,7 +82,7 @@ class MonsterTruckFlipEnvPitchRaw:
             return
         if not glfw.init():
             raise RuntimeError("GLFW init failed")
-        self.window = glfw.create_window(1000, 800, "MonsterTruck Flip (Raw Pitch)", None, None)
+        self.window = glfw.create_window(1000, 800, "MonsterTruck Flip (Signed φ, Forward Goal)", None, None)
         glfw.make_context_current(self.window)
         glfw.swap_interval(1)
         self.cam = mujoco.MjvCamera()
@@ -101,16 +109,33 @@ class MonsterTruckFlipEnvPitchRaw:
         glfw.swap_buffers(self.window)
         glfw.poll_events()
 
-    # ---------------- Kinematics ----------------
-    def _get_pitch_deg(self):
+    # ---------------- Signed flip angle φ ----------------
+    def _get_signed_flip_deg(self):
         """
-        RAW PITCH (flip angle) θ ∈ [0,180]:
-        angle between body -Z (roof normal) and world +Z (up).
-        Upside-down -> 0°, Upright -> 180°.
+        Signed angle φ between world up z_w and roof normal r_w = -Z_body,
+        measured about the body Y axis (y_w = R[:,1]):
+
+            φ = sign( (z_w × r_w) · y_w ) * arccos(z_w · r_w),  φ ∈ [-180, +180]
+
+        Convention:
+          φ = +180° : forward upright
+          φ = -180° : backward upright
+          φ =   0°  : upside-down
         """
         R = self.data.xmat[self.body_id].reshape(3, 3)  # body->world
-        c = clip(-R[2, 2], -1.0, 1.0)                   # (-Z_body)·(Z_world) = -R[2,2]
-        return math.degrees(math.acos(c))
+        z_w = np.array([0.0, 0.0, 1.0], dtype=float)
+        r_w = -R[:, 2]   # roof normal in world
+        y_w =  R[:, 1]   # body Y in world (pitch axis)
+
+        cosang = clip(float(np.dot(z_w, r_w)), -1.0, 1.0)
+        theta = math.degrees(math.acos(cosang))   # unsigned [0, 180]
+        tri = float(np.dot(np.cross(z_w, r_w), y_w))  # signed area about y_w
+
+        # Resolve flip sign once (avoid ambiguity at φ≈0)
+        if theta > 0.5 and abs(tri) > 1e-9:
+            self._flip_sign = 1.0 if tri > 0.0 else -1.0
+        s = self._flip_sign if self._flip_sign != 0.0 else 1.0
+        return s * theta
 
     # ---------------- Core API ----------------
     def reset(self):
@@ -124,11 +149,12 @@ class MonsterTruckFlipEnvPitchRaw:
         self.step_count = 0
         self.last_throttle = 0.0
         self.hold_counter = 0
+        self._flip_sign = 0.0
 
-        p = self._get_pitch_deg()   # ~0° at start
-        self.prev_pitch_deg = p
+        phi = self._get_signed_flip_deg()   # ~0° at start
+        self.prev_phi_deg = phi
         self.last_rate_deg = 0.0
-        return np.array([p, 0.0], dtype=np.float32)
+        return np.array([phi, 0.0], dtype=np.float32)
 
     def step(self, a_idx):
         throttle = float(self.actions[a_idx])
@@ -138,53 +164,54 @@ class MonsterTruckFlipEnvPitchRaw:
 
         # Apply control for frame_skip steps
         for _ in range(self.frame_skip):
-            # send the same throttle to first two actuators
             for i in range(min(2, self.model.nu)):
                 self.data.ctrl[i] = throttle
             mujoco.mj_step(self.model, self.data)
             if self.realtime:
                 time.sleep(self.dt)
 
-        # Orientation and angular motion (DEGREES)
-        pitch_deg = self._get_pitch_deg()                       # θ_raw ∈ [0,180]
+        # Signed angle and rate (DEGREES)
+        phi_deg = self._get_signed_flip_deg()                  # φ ∈ [-180, +180]
         horizon_dt = max(self.frame_skip * self.dt, 1e-6)
-        dpitch_deg = (pitch_deg - self.prev_pitch_deg)
-        pitch_rate_deg = dpitch_deg / horizon_dt                # deg/s
-        pitch_rate_rad = math.radians(pitch_rate_deg)
+        dphi_deg = (phi_deg - self.prev_phi_deg)
+        phi_rate_deg = dphi_deg / horizon_dt                   # deg/s
+        phi_rate_rad = math.radians(phi_rate_deg)
 
-        # Print angles only when rendering
         if self.render_enabled:
             print(
                 f"[Render] step={self.step_count:4d} | "
-                f"raw_pitch={pitch_deg:7.2f}° | dθ/dt={pitch_rate_deg:+8.2f}°/s"
+                f"phi={phi_deg:+7.2f}° | dφ/dt={phi_rate_deg:+8.2f}°/s"
             )
 
-        # ---------------- θ_raw-ONLY REWARD ----------------
-        # Distance (use θ_raw only): raw_dist=1 far, 0 at upright
-        raw_dist = np.clip((180.0 - pitch_deg) / 180.0, 0.0, 1.0)
+        # --------- FORWARD-GOAL DISTANCE (directional) ----------
+        # d_fwd = (180 - φ)/180 in [0,2]; >1 when φ < 0 (backward side)
+        d_fwd = (180.0 - phi_deg) / 180.0
+        d_fwd_clip2 = np.clip(d_fwd, 0.0, 2.0)   # for penalty shaping
+        d_fwd_clip1 = np.clip(d_fwd, 0.0, 1.0)   # for near/far gates
 
-        # Smooth, saturating distance penalty in terms of θ_raw
-        pos_penalty = self.R["position"] * (np.tanh(3.0 * raw_dist) ** 2)
+        # Position penalty: smooth, saturating; grows even more when φ goes backward (<0)
+        # (Scale 2.2 makes tanh hit ~0.999 near d_fwd=2)
+        pos_penalty = self.R["position"] * (np.tanh(2.2 * d_fwd_clip2) ** 2)
 
-        # Gates in terms of θ_raw
-        near_gate = np.exp(-12.0 * raw_dist)        # ~1 near upright, ~0 when far
-        far_gate  = 1.0 - np.exp(-8.0  * raw_dist)  # ~1 far, ~0 near upright
+        # Gates by forward distance (not symmetric)
+        near_gate = np.exp(-12.0 * d_fwd_clip1)        # ~1 near goal (+180), ~0 when far
+        far_gate  = 1.0 - np.exp(-8.0  * d_fwd_clip1)  # ~1 when far from goal
 
         # MountainCar-style momentum: reward speed in EITHER direction when far
-        mom_reward = self.R["momentum"] * far_gate * abs(pitch_rate_rad)
+        mom_reward = self.R["momentum"] * far_gate * abs(phi_rate_rad)
 
-        # Near-upright braking to prevent overshoot (penalize speed close to goal)
-        vel_brake = -self.R["stop_boost"] * near_gate * (pitch_rate_rad ** 2)
+        # Near-upright braking to prevent overshoot
+        vel_brake = -self.R["stop_boost"] * near_gate * (phi_rate_rad ** 2)
 
         energy_pen = self.R["energy"] * (throttle ** 2)
         time_pen   = self.R["time"]
         jerk_pen   = self.R["jerk"] * abs(throttle - prev_throttle)
 
         reward = -pos_penalty + mom_reward + vel_brake - energy_pen - time_pen - jerk_pen
-        reward = clip(reward, -10.0, 10.0)    # tight clip to prevent spikes
+        reward = clip(reward, -10.0, 10.0)
 
-        # Success: close to 180° raw, small rate, steady a few ticks
-        if (pitch_deg > 176.0) and (abs(pitch_rate_deg) < 6.0) and (abs(dpitch_deg) < 0.8):
+        # Success: FORWARD ONLY (φ ≈ +180°), small rate, steady a few ticks
+        if (abs(phi_deg) > 178.0):
             self.hold_counter += 1
             if self.hold_counter >= self.hold_needed:
                 reward += self.R["success"]
@@ -192,19 +219,19 @@ class MonsterTruckFlipEnvPitchRaw:
         else:
             self.hold_counter = 0
 
-        self.prev_pitch_deg = pitch_deg
-        self.last_rate_deg = pitch_rate_deg
+        self.prev_phi_deg = phi_deg
+        self.last_rate_deg = phi_rate_deg
         self.step_count += 1
         if self.step_count >= self.max_steps:
             done = True
 
         self._render()
 
-        next_obs = np.array([pitch_deg, pitch_rate_deg], dtype=np.float32)
+        next_obs = np.array([phi_deg, phi_rate_deg], dtype=np.float32)
         info = {
             "success": success,
-            "pitch_deg": pitch_deg,
-            "pitch_rate_deg": pitch_rate_deg
+            "phi_deg": phi_deg,
+            "phi_rate_deg": phi_rate_deg
         }
         return next_obs, float(reward), done, info
 
@@ -216,13 +243,13 @@ class MonsterTruckFlipEnvPitchRaw:
 
 
 # ===============================================================
-# Tile Coder + Q-learning Agent (2D tiles: [pitch, pitch_rate])
+# Tile Coder + Q-learning Agent (2D tiles: [φ, φ_rate])
 # ===============================================================
 class TileCoder:
     def __init__(self, lows, highs, n_tiles, n_tilings, seed=0):
         self.lows = np.array(lows, dtype=np.float32)
         self.highs = np.array(highs, dtype=np.float32)
-        self.n_tiles = np.array(n_tiles, dtype=np.int32)  # length must match dim
+        self.n_tiles = np.array(n_tiles, dtype=np.int32)
         self.n_tilings = int(n_tilings)
         self.dim = len(lows)
         rng = np.random.default_rng(seed)
@@ -291,8 +318,7 @@ class TileQAgent:
         self._delta_count += 1
 
     def avg_update(self):
-        if self._delta_count == 0:
-            return 0.0
+        if self._delta_count == 0: return 0.0
         v = self._delta_accum / self._delta_count
         self._delta_accum = 0.0
         self._delta_count = 0
@@ -323,17 +349,17 @@ def evaluate_episode(env, agent, max_steps=1500):
 def run_greedy_trace(env, agent, max_steps=1500):
     obs = env.reset()
 
-    t_steps, pitch_deg_hist, pitch_rate_hist, throttle_hist, rewards = [], [], [], [], []
+    t_steps, phi_deg_hist, phi_rate_hist, throttle_hist, rewards = [], [], [], [], []
 
     step = 0
     while step < max_steps:
-        p  = float(obs[0])   # pitch (deg, RAW flip angle)
-        pr = float(obs[1])   # pitch rate (deg/s)
+        p  = float(obs[0])   # φ (deg, signed)
+        pr = float(obs[1])   # φ rate (deg/s)
         a = agent.act_greedy(obs)
 
         t_steps.append(step)
-        pitch_deg_hist.append(p)
-        pitch_rate_hist.append(pr)
+        phi_deg_hist.append(p)
+        phi_rate_hist.append(pr)
         throttle_hist.append(float(env.actions[a]))
 
         obs, r, done, info = env.step(a)
@@ -345,8 +371,8 @@ def run_greedy_trace(env, agent, max_steps=1500):
 
     traces = dict(
         t=np.array(t_steps, dtype=int),
-        pitch_deg=np.array(pitch_deg_hist, dtype=float),
-        pitch_rate_deg=np.array(pitch_rate_hist, dtype=float),
+        phi_deg=np.array(phi_deg_hist, dtype=float),
+        phi_rate_deg=np.array(phi_rate_hist, dtype=float),
         throttle=np.array(throttle_hist, dtype=float),
         reward=np.array(rewards, dtype=float),
         cum_reward=np.cumsum(np.array(rewards, dtype=float)),
@@ -364,8 +390,8 @@ def save_episode_traces_figure(traces, outfile="tileq_episode_summary.png"):
         return y
 
     t   = traces["t"]
-    p   = traces["pitch_deg"]
-    pr  = traces["pitch_rate_deg"]
+    p   = traces["phi_deg"]
+    pr  = traces["phi_rate_deg"]
     thr = traces["throttle"]
     cre = traces["cum_reward"]
     thr_s = ema(thr, alpha=0.3)
@@ -374,15 +400,15 @@ def save_episode_traces_figure(traces, outfile="tileq_episode_summary.png"):
     (ax1, ax2), (ax3, ax4) = axs
 
     ax1.plot(t, p, lw=2)
-    ax1.set_title("Raw Pitch vs Timestep (0°=upside-down → 180°=upright)")
+    ax1.set_title("Signed Flip Angle φ vs Timestep (0°=upside-down, +180°=goal)")
     ax1.set_xlabel("Timestep")
-    ax1.set_ylabel("Pitch (deg)")
+    ax1.set_ylabel("φ (deg)")
     ax1.grid(True, alpha=0.3)
 
     ax2.plot(p, pr, lw=1.8)
-    ax2.set_title("Pitch Rate vs Pitch")
-    ax2.set_xlabel("Pitch (deg)")
-    ax2.set_ylabel("Pitch rate (deg/s)")
+    ax2.set_title("dφ/dt vs φ")
+    ax2.set_xlabel("φ (deg)")
+    ax2.set_ylabel("dφ/dt (deg/s)")
     ax2.grid(True, alpha=0.3)
 
     ax3.plot(t, thr, lw=1, alpha=0.25)
@@ -398,7 +424,7 @@ def save_episode_traces_figure(traces, outfile="tileq_episode_summary.png"):
     ax4.set_ylabel("Cumulative Reward")
     ax4.grid(True, alpha=0.3)
 
-    fig.suptitle("MonsterTruck Flip — Greedy Episode Summary (Raw Pitch + Rate, θ_raw-only)", fontsize=14)
+    fig.suptitle("MonsterTruck Flip — Greedy Episode Summary (Signed φ + Forward Distance)", fontsize=14)
     fig.tight_layout(rect=[0, 0.03, 1, 0.96])
     fig.savefig(outfile, dpi=220)
     plt.close(fig)
@@ -409,13 +435,12 @@ def save_episode_traces_figure(traces, outfile="tileq_episode_summary.png"):
 # Training
 # ===============================================================
 def train_tileq(episodes=1000, max_steps=1500, eval_every=50, num_actions=9):
-    env = MonsterTruckFlipEnvPitchRaw(render=False, realtime=False,
-                                      frame_skip=10, max_steps=max_steps, num_actions=num_actions)
+    env = MonsterTruckFlipEnvPitchSigned(render=False, realtime=False,
+                                         frame_skip=10, max_steps=max_steps, num_actions=num_actions)
 
-    # OBS: [pitch_deg (raw), pitch_rate_deg]
-    # Generous rate bounds for tiling only (physics unaffected).
-    lows  = [  0.0, -720.0]
-    highs = [180.0,  720.0]
+    # OBS: [φ (signed), φ_rate]
+    lows  = [-180.0, -720.0]
+    highs = [ 180.0,  720.0]
 
     agent = TileQAgent(lows, highs,
                        n_tiles=(48, 48), n_tilings=8,
@@ -475,14 +500,14 @@ def train_tileq(episodes=1000, max_steps=1500, eval_every=50, num_actions=9):
     # Save eval curve
     if len(eval_ep_indices) > 0:
         plt.figure(figsize=(9, 5))
-        plt.plot(eval_ep_indices, eval_rewards, 'o--', alpha=0.45, label='Raw eval reward')
+        plt.plot(eval_ep_indices, eval_rewards, 'o--', alpha=0.45, label='Eval reward')
         window = 5
         if len(eval_rewards) >= window:
             smoothed = np.convolve(eval_rewards, np.ones(window)/window, mode='valid')
             plt.plot(eval_ep_indices[window-1:], smoothed, '-', lw=2.2, label=f'{window}-pt Moving Avg')
         plt.xlabel("Episode")
         plt.ylabel("Evaluation Reward")
-        plt.title("TileQ — Raw Pitch flipping (θ_raw-only, with rate)")
+        plt.title("TileQ — Signed φ with forward-goal distance")
         plt.legend()
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
@@ -498,4 +523,4 @@ def train_tileq(episodes=1000, max_steps=1500, eval_every=50, num_actions=9):
 
 
 if __name__ == "__main__":
-    train_tileq(episodes=4000, max_steps=1500, eval_every=50, num_actions=9)
+    train_tileq(episodes=400, max_steps=1500, eval_every=50, num_actions=9)
