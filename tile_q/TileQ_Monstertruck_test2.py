@@ -1,21 +1,10 @@
 # ===============================================================
 # TileQLearning_Monstertruck_Pitch_SIGNED_FORWARD.py  (DEGREES)
-# Signed flip angle φ:
-#   φ ∈ [-180°, +180°]: 0° = upside-down, +180° = forward upright, -180° = backward upright
-#   ω: deg/s over frame_skip horizon (converted to rad/s for penalties)
-#
-# Forward-goal shaping (MountainCar-style):
-#   - Directional distance-to-goal (forward): d_fwd = (180 - φ)/180 ∈ [0, 2]
-#       * φ = 0°  -> d_fwd = 1
-#       * φ = -30 -> d_fwd = 210/180 > 1  (penalize "going backward")
-#       * φ = +180 -> d_fwd = 0 (goal)
-#   - Momentum reward uses |ω| when far (allows rocking), brake near goal
-#
-# Reward:
-#   r = - position(d_fwd) + momentum(|ω|, far(d_fwd)) - near_upright_brake(ω^2, near(d_fwd))
-#       - energy(u^2) - time - jerk(|Δu|)
-#
-# Includes cumulative reward plot + greedy trace plots.
+# - Deterministic tilings + global seed for reproducible runs
+# - Signed flip angle φ in [-180°, +180°]:
+#     0° = upside-down, +180° = forward upright, -180° = backward upright
+# - Forward-goal shaping (MountainCar-style)
+# - Cumulative reward + greedy trace plots
 # ===============================================================
 
 import os, math, time, json
@@ -36,7 +25,7 @@ class MonsterTruckFlipEnvPitchSigned:
     def __init__(self, xml_path="monstertruck.xml",
                  frame_skip=10, max_steps=2000,
                  render=False, realtime=False,
-                 num_actions=9):
+                 num_actions=9, seed: int = 0):
         if not os.path.exists(xml_path):
             raise FileNotFoundError(f"Cannot find {xml_path}")
         self.model = mujoco.MjModel.from_xml_path(xml_path)
@@ -46,6 +35,9 @@ class MonsterTruckFlipEnvPitchSigned:
         self.render_enabled = render
         self.realtime = realtime
         self.dt = self.model.opt.timestep
+
+        # reproducible RNG for env-only randomness
+        self.rng = np.random.default_rng(seed)
 
         self.actions = np.linspace(-1.0, 1.0, num_actions).astype(np.float32)
         self.last_throttle = 0.0
@@ -57,13 +49,13 @@ class MonsterTruckFlipEnvPitchSigned:
 
         # Reward weights
         self.R = dict(
-            position=2.5,     # directional distance penalty via d_fwd
-            momentum=1.5,    # MountainCar-style momentum reward (|ω| when far)
-            stop_boost=0.02,  # near-upright brake on ω^2
-            energy=0.05,      # control effort penalty
-            time=0.10,        # per-step time cost
-            jerk=0.02,        # |Δu|
-            success=500.0     # terminal bonus
+            position=4.50,     # directional distance penalty via d_fwd
+            momentum=2.0,      # MountainCar-style momentum reward (|ω| when far)
+            stop_boost=0.0,    # near-upright brake on ω^2
+            energy=0.5,        # control effort penalty
+            time=1.0,          # per-step time cost
+            jerk=0.5,          # |Δu|
+            success=3000.0     # terminal bonus
         )
 
         # State memory
@@ -141,7 +133,7 @@ class MonsterTruckFlipEnvPitchSigned:
     def reset(self):
         mujoco.mj_resetData(self.model, self.data)
         # Upside-down spawn
-        self.data.qpos[:3] = np.array([0, 0, 0.3]) + 0.01 * np.random.randn(3)
+        self.data.qpos[:3] = np.array([0, 0, 0.3]) + 0.01 * self.rng.normal(size=3)
         self.data.qvel[:] = 0.0
         self.data.qpos[3:7] = np.array([0, 1, 0, 0])  # 180° about X → upside-down
         mujoco.mj_forward(self.model, self.data)
@@ -184,13 +176,11 @@ class MonsterTruckFlipEnvPitchSigned:
             )
 
         # --------- FORWARD-GOAL DISTANCE (directional) ----------
-        # d_fwd = (180 - φ)/180 in [0,2]; >1 when φ < 0 (backward side)
-        d_fwd = (180.0 - phi_deg) / 180.0
-        d_fwd_clip2 = np.clip(d_fwd, 0.0, 2.0)   # for penalty shaping
-        d_fwd_clip1 = np.clip(d_fwd, 0.0, 1.0)   # for near/far gates
+        d_fwd = (180.0 - phi_deg) / 180.0           # in [0,2]; >1 when φ < 0 (backward side)
+        d_fwd_clip2 = np.clip(d_fwd, 0.0, 2.0)      # for penalty shaping
+        d_fwd_clip1 = np.clip(d_fwd, 0.0, 1.0)      # for near/far gates
 
-        # Position penalty: smooth, saturating; grows even more when φ goes backward (<0)
-        # (Scale 2.2 makes tanh hit ~0.999 near d_fwd=2)
+        # Position penalty: smooth, saturating; grows more when φ goes backward (<0)
         pos_penalty = self.R["position"] * (np.tanh(2.2 * d_fwd_clip2) ** 2)
 
         # Gates by forward distance (not symmetric)
@@ -246,18 +236,22 @@ class MonsterTruckFlipEnvPitchSigned:
 # Tile Coder + Q-learning Agent (2D tiles: [φ, φ_rate])
 # ===============================================================
 class TileCoder:
-    def __init__(self, lows, highs, n_tiles, n_tilings, seed=0):
+    def __init__(self, lows, highs, n_tiles, n_tilings, seed: int = 0):
         self.lows = np.array(lows, dtype=np.float32)
         self.highs = np.array(highs, dtype=np.float32)
         self.n_tiles = np.array(n_tiles, dtype=np.int32)
         self.n_tilings = int(n_tilings)
         self.dim = len(lows)
-        rng = np.random.default_rng(seed)
-        self.offsets = rng.uniform(0, 1, (self.n_tilings, self.dim)) / self.n_tiles
+
+        # ---- Deterministic, centered offsets per tiling ----
+        # til_axis[t] = (2t+1)/(2*n_tilings) ∈ (0,1), evenly spread
+        til_axis = (np.arange(self.n_tilings) * 2 + 1) / (2.0 * self.n_tilings)  # (T,)
+        # same offset pattern applied across dims, then scaled by 1/n_tiles to be within one tile
+        self.offsets = np.tile(til_axis[:, None], (1, self.dim)) / self.n_tiles  # (T, dim)
 
     def encode(self, s):
         s = np.array(s, dtype=np.float32)
-        ratios = (s - self.lows) / (self.highs - self.lows + 1e-8)
+        ratios = (s - self.lows) / (self.highs - self.lows + 1e-8)  # normalize to ~[0,1]
         ratios = np.clip(ratios, 0, 0.999999)
         idxs = []
         base = int(np.prod(self.n_tiles))
@@ -277,13 +271,18 @@ class TileQAgent:
     def __init__(self, obs_low, obs_high,
                  n_tiles=(48, 48), n_tilings=8,
                  n_actions=9, alpha=0.02, gamma=0.98,
-                 eps_start=0.99, eps_end=0.01, total_episodes=5000):
+                 eps_start=0.99, eps_end=0.01, total_episodes=5000,
+                 seed: int = 0):
         self.gamma = gamma
         self.alpha = alpha / float(n_tilings)   # classic tiles update
         self.eps_start, self.eps_end = eps_start, eps_end
         self.total_episodes = total_episodes
         self.n_actions = n_actions
-        self.tc = TileCoder(obs_low, obs_high, n_tiles, n_tilings)
+
+        # reproducible RNG for agent exploration
+        self.rng = np.random.default_rng(seed)
+
+        self.tc = TileCoder(obs_low, obs_high, n_tiles, n_tilings, seed=seed)
         self.n_features = self.tc.total_tiles
         self.w = np.zeros((n_actions, self.n_features), dtype=np.float32)
         self.current_episode = 0
@@ -300,8 +299,8 @@ class TileQAgent:
         return np.array([np.sum(self.w[a, idxs]) for a in range(self.n_actions)], dtype=np.float32)
 
     def act(self, obs):
-        if np.random.rand() < self.eps:
-            return np.random.randint(self.n_actions)
+        if self.rng.random() < self.eps:
+            return int(self.rng.integers(self.n_actions))
         return int(np.argmax(self.Qs(obs)))
 
     def act_greedy(self, obs):
@@ -434,9 +433,13 @@ def save_episode_traces_figure(traces, outfile="tileq_episode_summary.png"):
 # ===============================================================
 # Training
 # ===============================================================
-def train_tileq(episodes=1000, max_steps=1500, eval_every=50, num_actions=9):
+def train_tileq(episodes=1000, max_steps=1500, eval_every=50, num_actions=9, seed: int = 0):
+    # global numpy seed for any incidental numpy use outside env/agent RNGs
+    np.random.seed(seed)
+
     env = MonsterTruckFlipEnvPitchSigned(render=False, realtime=False,
-                                         frame_skip=10, max_steps=max_steps, num_actions=num_actions)
+                                         frame_skip=10, max_steps=max_steps,
+                                         num_actions=num_actions, seed=seed)
 
     # OBS: [φ (signed), φ_rate]
     lows  = [-180.0, -720.0]
@@ -445,7 +448,8 @@ def train_tileq(episodes=1000, max_steps=1500, eval_every=50, num_actions=9):
     agent = TileQAgent(lows, highs,
                        n_tiles=(48, 48), n_tilings=8,
                        n_actions=len(env.actions),
-                       total_episodes=episodes)
+                       total_episodes=episodes,
+                       seed=seed)
 
     rewards_list, success_flags, eval_ep_indices, eval_rewards = [], [], [], []
     successes = 0
@@ -523,4 +527,5 @@ def train_tileq(episodes=1000, max_steps=1500, eval_every=50, num_actions=9):
 
 
 if __name__ == "__main__":
-    train_tileq(episodes=400, max_steps=1500, eval_every=50, num_actions=9)
+    # set your favorite seed here
+    train_tileq(episodes=600, max_steps=1500, eval_every=50, num_actions=9, seed=42)
