@@ -26,7 +26,7 @@ class MonsterTruckFlipEnv:
     Action: throttle in [-1, 1], applied to both rear motors.
     """
 
-    def __init__(self, xml_path="monstertruck.xml",
+    def __init__(self, xml_path="monstertruck.model",
                  frame_skip=40,           # large action repeat for speed
                  max_steps=600,           # shorter episodes
                  render=False,
@@ -375,7 +375,7 @@ def train_td3(
     save_every=100,
     seed=0,
     device="cuda",
-    xml_path="monstertruck.xml",
+    xml_path="monstertruck.model",
     do_eval_render=False
 ):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
@@ -450,7 +450,7 @@ def train_td3(
 
 
 if __name__ == "__main__":
-    # For extra sim speed (optional), in monstertruck.xml use:
+    # For extra sim speed (optional), in monstertruck.model use:
     # <option integrator="Euler" timestep="0.002"/>
     train_td3(
         episodes=500,

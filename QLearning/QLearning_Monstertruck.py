@@ -33,7 +33,7 @@ def quat_to_rp(q):
 # Environment
 # ============================================================
 class MonsterTruckFlipEnvYPR:
-    def __init__(self, xml_path="monstertruck.xml",
+    def __init__(self, xml_path="monstertruck.model",
                  frame_skip=10, max_steps=2000,
                  render=False, realtime=False):
         if not os.path.exists(xml_path):
