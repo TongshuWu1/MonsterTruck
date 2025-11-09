@@ -54,13 +54,13 @@ class MonsterTruckFlipEnvPitchSigned:
 
         # Reward weights (UNCHANGED)
         self.R = dict(
-            position=3.50,     # directional distance penalty via d_fwd
-            momentum=2.0,      # MountainCar-style momentum reward (|ω| when far)
-            stop_boost=0.0,    # near-upright brake on ω^2
-            energy=0.15,        # control effort penalty
+            position=2.0,     # directional distance penalty via d_fwd
+            momentum=1.0,      # MountainCar-style momentum reward (|ω| when far)
+            stop_boost=0.1,    # near-upright brake on ω^2
+            energy=0.3,       # control effort penalty
             time=1.0,          # per-step time cost
             jerk=0.3,          # |Δu|
-            success=2000.0     # terminal bonus
+            success=800.0     # terminal bonus
         )
 
         # State memory
@@ -79,6 +79,17 @@ class MonsterTruckFlipEnvPitchSigned:
         self._use_potential = False
         self.gamma_train = 0.98
         self._prev_min_height = 0.0  # used only when potential shaping is on
+
+        # -------- Explicit actuator hookup (ALL FOUR WHEELS) -----
+        # Ensures same torque & orientation on all four wheel motors.
+        self.throttle_ids = []
+        for name in ["front_left_motor", "front_right_motor", "rear_left_motor", "rear_right_motor"]:
+            aid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
+            if aid != -1:
+                self.throttle_ids.append(aid)
+        if not self.throttle_ids:
+            # fallback: if names not found, drive all available actuators
+            self.throttle_ids = list(range(self.model.nu))
 
         # Viewer
         self._viewer_ready = False
@@ -181,7 +192,6 @@ class MonsterTruckFlipEnvPitchSigned:
 
         # Archive-mixed resets: sometimes start near-contact to actually SEE success
         if self.archive and (self.rng.random() < self.reset_mix_prob):
-            # FIX: choose by index (archive holds tuples with arrays; ragged for np.choice)
             i = int(self.rng.integers(len(self.archive)))
             snap = self.archive[i]
             self._restore(snap)
@@ -208,16 +218,19 @@ class MonsterTruckFlipEnvPitchSigned:
         return np.array([phi, 0.0], dtype=np.float32)
 
     def step(self, throttle):
-        """Continuous throttle in [-1, 1]."""
+        """Continuous throttle in [-1, 1], applied to ALL four wheel actuators."""
         throttle = float(np.clip(throttle, -1.0, 1.0))
         prev_throttle = self.last_throttle
         self.last_throttle = throttle
         done, success = False, False
 
-        # Apply control for frame_skip steps
+        # Apply control for frame_skip steps — DRIVE ALL FOUR WHEELS
         for _ in range(self.frame_skip):
-            for i in range(min(2, self.model.nu)):
-                self.data.ctrl[i] = throttle
+            # clear then set control values for designated wheel motors
+            if self.model.nu > 0:
+                self.data.ctrl[:self.model.nu] = 0.0
+                for aid in self.throttle_ids:
+                    self.data.ctrl[aid] = throttle
             mujoco.mj_step(self.model, self.data)
             if self.realtime:
                 time.sleep(self.dt)
@@ -232,7 +245,8 @@ class MonsterTruckFlipEnvPitchSigned:
         if self.render_enabled:
             print(
                 f"[Render] step={self.step_count:4d} | "
-                f"phi={phi_deg:+7.2f}° | dφ/dt={phi_rate_deg:+8.2f}°/s | u={throttle:+.3f}"
+                f"phi={phi_deg:+7.2f}° | dφ/dt={phi_rate_deg:+8.2f}°/s | u={throttle:+.3f} | "
+                f"ctrl={np.round(self.data.ctrl[:self.model.nu],3)}"
             )
 
         # --------- FORWARD-GOAL DISTANCE (directional) ----------
@@ -450,7 +464,6 @@ class TileQContAgent:
     # -------- Policy-side prior (no reward change) --------
     def observe(self, s, a, s_next):
         """Update empirical torque→φ̇ sign and remember last action (metadata only)."""
-        # Learn whether positive action tends to increase φ (through φ̇)
         if abs(a) > 0.4 and abs(s_next[1]) > 10.0:  # need some signal
             corr = np.sign(a) * np.sign(s_next[1])  # +1: +u → +φ̇ ; -1: +u → -φ̇
             self.gain_sign = 1 if corr >= 0 else -1

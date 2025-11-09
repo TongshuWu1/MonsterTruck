@@ -61,8 +61,11 @@
   </worldbody>
 
   <!-- Rear-wheel motors for throttle -->
-  <actuator>
-    <motor name="rear_left_motor" joint="j_rl" gear="350"/>
-    <motor name="rear_right_motor" joint="j_rr" gear="350"/>
-  </actuator>
+<actuator>
+  <motor name="front_left_motor"  joint="j_fl" gear="250"/>
+  <motor name="front_right_motor" joint="j_fr" gear="250"/>
+  <motor name="rear_left_motor"   joint="j_rl" gear="250"/>
+  <motor name="rear_right_motor"  joint="j_rr" gear="250"/>
+</actuator>
+
 </mujoco>
