@@ -7,26 +7,35 @@ import time
 # ==============================
 # Load model
 # ==============================
-xml_path = os.path.join(os.path.dirname(__file__), "monstertruck.model")
+xml_path = os.path.join(os.path.dirname(__file__), "monstertruck.xml")
 if not os.path.exists(xml_path):
     raise FileNotFoundError(f"XML file not found: {xml_path}")
 
 model = mujoco.MjModel.from_xml_path(xml_path)
 data = mujoco.MjData(model)
 
+# Resolve wheel actuator IDs (by name); fallback to all actuators if not found
+wheel_motor_names = ["front_left_motor", "front_right_motor", "rear_left_motor", "rear_right_motor"]
+drive_ids, drive_names = [], []
+for name in wheel_motor_names:
+    aid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
+    if aid != -1:
+        drive_ids.append(aid)
+        drive_names.append(name)
+if not drive_ids:
+    drive_ids = list(range(model.nu))
+    drive_names = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, i) or f"act{i}" for i in drive_ids]
+print(f"Driving actuators: {drive_names} (ids: {drive_ids})")
+
 # ==============================
-# Initial spawn (Option 2 — flat, low upside-down start)
+# Initial spawn (upside-down)
 # ==============================
 mujoco.mj_resetData(model, data)
-
-# Slightly above the ground so the hood doesn't roll
-data.qpos[:3] = np.array([0.0, 0.0, 0.2])   # tune 0.54–0.57 as needed
+data.qpos[:3] = np.array([0.0, 0.0, 0.2])  # small lift off ground
 data.qvel[:] = 0.0
-# Fully upside-down (180° about Y axis)
-data.qpos[3:7] = np.array([0, 1, 0, 0])
+data.qpos[3:7] = np.array([0, 1, 0, 0])    # 180° about X → upside-down
 mujoco.mj_forward(model, data)
 
-# Check spawn height to verify no penetration
 chassis_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "chassis")
 print(f"Initial chassis COM z: {data.xpos[chassis_id,2]:.3f} m")
 
@@ -42,9 +51,8 @@ if not window:
     raise Exception("GLFW window creation failed")
 
 glfw.make_context_current(window)
-glfw.swap_interval(1)  # enable vsync (driver-dependent)
+glfw.swap_interval(1)  # vsync
 
-# Optional: report monitor refresh rate
 try:
     mode = glfw.get_video_mode(glfw.get_primary_monitor())
     if mode:
@@ -65,7 +73,7 @@ cam.azimuth = 90
 # Keyboard Controls
 # ==============================
 throttle = 0.0
-MAX_TORQUE = 1.0
+MAX_TORQUE = 1.0  # control ∈ [-1,1]; scaled by gear in XML
 
 def key_callback(window, key, scancode, action, mods):
     global throttle
@@ -87,7 +95,6 @@ glfw.set_key_callback(window, key_callback)
 print("Controls: W=Forward | S=Reverse | SPACE=Stop | ESC=Quit")
 frame_skip = 10
 REALTIME = True
-timestep = model.opt.timestep
 sim_start_wall = time.perf_counter()
 last_print = sim_start_wall
 
@@ -95,10 +102,12 @@ while not glfw.window_should_close(window):
     if glfw.get_key(window, glfw.KEY_ESCAPE) == glfw.PRESS:
         break
 
-    # Apply throttle to both rear-wheel motors
-    if model.nu >= 2:
-        data.ctrl[0] = throttle
-        data.ctrl[1] = throttle
+    # Apply throttle to ALL selected wheel motors
+    if model.nu > 0:
+        # zero all controls first (prevents stale values on other actuators)
+        data.ctrl[:model.nu] = 0.0
+        for aid in drive_ids:
+            data.ctrl[aid] = throttle
 
     # Step physics faster than render
     for _ in range(frame_skip):
@@ -133,7 +142,9 @@ while not glfw.window_should_close(window):
     now = time.perf_counter()
     if now - last_print > 1.0:
         speed_ratio = data.time / (now - sim_start_wall + 1e-9)
-        print(f"Sim time: {data.time:.2f}s | speed ×{speed_ratio:.2f}")
+        # Show current control values for debug
+        ctrl_vals = np.round(data.ctrl[:model.nu], 3)
+        print(f"Sim time: {data.time:.2f}s | speed ×{speed_ratio:.2f} | throttle {throttle:+.2f} | ctrl={ctrl_vals}")
         last_print = now
 
 glfw.terminate()
