@@ -31,7 +31,7 @@ print(f"Driving actuators: {drive_names} (ids: {drive_ids})")
 # Initial spawn (upside-down)
 # ==============================
 mujoco.mj_resetData(model, data)
-data.qpos[:3] = np.array([0.0, 0.0, 0.2])  # small lift off ground
+data.qpos[:3] = np.array([0.0, 0.0, 0.25])  # small lift off ground
 data.qvel[:] = 0.0
 data.qpos[3:7] = np.array([0, 1, 0, 0])    # 180° about X → upside-down
 mujoco.mj_forward(model, data)
