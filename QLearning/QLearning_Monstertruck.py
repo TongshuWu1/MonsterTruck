@@ -1,7 +1,8 @@
 # ===============================================================
-# QLearning_Monstertruck_PitchSigned_LinMom_BATCH10.py
+# QLearning_Monstertruck_PitchSigned_IMU.py
 # Tabular Q-learning on [phi_deg, phi_rate_deg] with 9 actions
 # - Environment: signed-φ reward with linear, signed momentum term
+# - φ, φ̇ come from quaternion + IMU sensors (imu_gyro)
 # - Success: hysteresis + velocity gate for reliable termination
 # - Printing: store per-episode rewards; print the last-10 as a batch
 # - Eval: every eval_every episodes, run 3 eval rollouts and RENDER ONLY THE FIRST
@@ -28,10 +29,54 @@ def angdiff_deg(curr, prev):
     return ((curr - prev + 180.0) % 360.0) - 180.0
 
 
+# ---------- quat & unwrap helpers (from IMU demo) ----------
+def quat_to_R_and_pitch(qw, qx, qy, qz):
+    """
+    Convert unit quaternion (w, x, y, z) to rotation matrix R (body->world)
+    and a standard Euler pitch (for debugging).
+    """
+    R00 = 1 - 2*(qy*qy + qz*qz)
+    R01 = 2*(qx*qy - qw*qz)
+    R02 = 2*(qx*qz + qw*qy)
+
+    R10 = 2*(qx*qy + qw*qz)
+    R11 = 1 - 2*(qx*qx + qz*qz)
+    R12 = 2*(qy*qz - qw*qx)
+
+    R20 = 2*(qx*qz - qw*qy)
+    R21 = 2*(qy*qz + qw*qx)
+    R22 = 1 - 2*(qx*qx + qy*qy)
+
+    pitch = -math.asin(max(-1.0, min(1.0, R20)))  # classic pitch, rad
+
+    R = np.array([[R00, R01, R02],
+                  [R10, R11, R12],
+                  [R20, R21, R22]], dtype=float)
+    return R, pitch
+
+
+def unwrap_angle(prev_angle, prev_unwrapped, angle):
+    """
+    Incremental unwrap of an angle in [-pi, pi] so it becomes continuous.
+    """
+    if prev_angle is None:
+        return angle, angle  # first call
+    d = angle - prev_angle
+    if d > math.pi:
+        angle_unwrapped = prev_unwrapped + (d - 2*math.pi)
+    elif d < -math.pi:
+        angle_unwrapped = prev_unwrapped + (d + 2*math.pi)
+    else:
+        angle_unwrapped = prev_unwrapped + d
+    return angle, angle_unwrapped
+
+
 # ===============================================================
-# Environment: Signed φ + forward-goal distance
+# Environment: Signed φ + forward-goal distance (IMU-based state)
 # - Linear, signed momentum term
 # - Success hysteresis + velocity gate
+# - φ from up-vector circle (z,x) using quaternion
+# - φ̇ from imu_gyro (body Y axis)
 # ===============================================================
 class MonsterTruckFlipEnvPitchSigned:
     def __init__(self, xml_path="monstertruck.xml",
@@ -55,7 +100,35 @@ class MonsterTruckFlipEnvPitchSigned:
 
         self.body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "chassis")
 
-        # Reward weights (base = original; momentum term is changed in form only)
+        # ---------- Free joint quaternion indices ----------
+        # Find the free joint (chassis freejoint) and locate qw,qx,qy,qz in qpos.
+        free_j = next(
+            j for j in range(self.model.njnt)
+            if self.model.jnt_type[j] == mujoco.mjtJoint.mjJNT_FREE
+        )
+        # qpos layout for mjJNT_FREE: [x, y, z, qw, qx, qy, qz]
+        self.qadr = self.model.jnt_qposadr[free_j] + 3  # skip x,y,z -> start at qw
+
+        # ---------- IMU sensors ----------
+        gyro_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, "imu_gyro")
+        if gyro_id < 0:
+            raise RuntimeError("imu_gyro sensor not found in model XML")
+        self.gyro_adr = self.model.sensor_adr[gyro_id]
+
+        acc_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, "imu_acc")
+        if acc_id < 0:
+            raise RuntimeError("imu_acc sensor not found in model XML")
+        self.acc_adr = self.model.sensor_adr[acc_id]
+
+        # ---------- Angle-unwrapping state ----------
+        self._prev_theta = None          # last wrapped angle (rad)
+        self._theta_unwrapped = 0.0      # running unwrapped angle (rad)
+        self._theta0 = None              # reference so flip_rel starts near 0
+
+        self.prev_phi_deg = 0.0          # for optional logging
+        self.last_rate_deg = 0.0
+
+        # Reward weights (same as before; linear momentum term in form only)
         self.R = dict(
             position=2.0,
             momentum=4.0,   # scales linear signed momentum
@@ -71,13 +144,10 @@ class MonsterTruckFlipEnvPitchSigned:
         self.success_release_deg  = 176.5  # don't reset unless |phi| < 176.5°
         self.max_upright_rate_deg = 60.0   # must be relatively still to count hold
 
-        self.prev_phi_deg = 0.0
-        self.last_rate_deg = 0.0
-        self._flip_sign = 0.0  # +1 forward, -1 backward
-
         # Drive all four wheel actuators (fallback: drive all actuators)
         self.throttle_ids = []
-        for name in ["front_left_motor", "front_right_motor", "rear_left_motor", "rear_right_motor"]:
+        for name in ["front_left_motor", "front_right_motor",
+                     "rear_left_motor", "rear_right_motor"]:
             aid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
             if aid != -1:
                 self.throttle_ids.append(aid)
@@ -95,7 +165,9 @@ class MonsterTruckFlipEnvPitchSigned:
             return
         if not glfw.init():
             raise RuntimeError("GLFW init failed")
-        self.window = glfw.create_window(1000, 800, "MonsterTruck Flip (Signed φ, Forward Goal)", None, None)
+        self.window = glfw.create_window(1000, 800,
+                                         "MonsterTruck Flip (IMU Signed φ, Forward Goal)",
+                                         None, None)
         glfw.make_context_current(self.window)
         glfw.swap_interval(1)
         self.cam = mujoco.MjvCamera()
@@ -122,26 +194,45 @@ class MonsterTruckFlipEnvPitchSigned:
         glfw.swap_buffers(self.window)
         glfw.poll_events()
 
-    # ---------------- Signed flip angle φ ----------------
-    def _get_signed_flip_deg(self):
+    # ---------------- φ and φ̇ from quat + IMU gyro ----------------
+    def _get_phi_and_rate_from_imu(self):
         """
-        Signed angle φ between world up z_w and roof normal r_w = -Z_body,
-        measured about the body Y axis (pitch axis):
-            φ = sign( (z_w × r_w) · y_w ) * arccos(z_w · r_w) ∈ [-180,+180]
+        Use the chassis freejoint quaternion + IMU gyro to compute:
+          - phi_deg: unwrapped flip angle in degrees
+                     0°   ≈ upside-down initial pose
+                     ±180° ≈ upright goal (one full flip)
+          - phi_rate_deg: pitch rate from IMU (deg/s), around body Y
         """
-        R = self.data.xmat[self.body_id].reshape(3, 3)  # body->world
-        z_w = np.array([0.0, 0.0, 1.0], dtype=float)
-        r_w = -R[:, 2]   # roof normal in world
-        y_w =  R[:, 1]   # body Y in world (pitch axis)
+        # 1) Quaternion from free joint
+        qw, qx, qy, qz = self.data.qpos[self.qadr:self.qadr + 4]
+        R, _ = quat_to_R_and_pitch(qw, qx, qy, qz)
 
-        cosang = clip(float(np.dot(z_w, r_w)), -1.0, 1.0)
-        theta = math.degrees(math.acos(cosang))   # unsigned [0,180]
-        tri = float(np.dot(np.cross(z_w, r_w), y_w))  # signed area about y_w
+        # 2) Up vector in world = 3rd column of R (body Z axis)
+        up_x, up_y, up_z = R[0, 2], R[1, 2], R[2, 2]
 
-        if theta > 0.5 and abs(tri) > 1e-9:
-            self._flip_sign = 1.0 if tri > 0.0 else -1.0
-        s = self._flip_sign if self._flip_sign != 0.0 else 1.0
-        return s * theta
+        # 3) Angle of up vector in (z,x) plane: atan2(v_x, v_z) ∈ [-pi, pi]
+        theta = math.atan2(up_x, up_z)
+
+        # 4) Unwrap over time to avoid jump at ±pi
+        self._prev_theta, self._theta_unwrapped = unwrap_angle(
+            self._prev_theta,
+            self._theta_unwrapped,
+            theta
+        )
+
+        # 5) Define reference at the first call so car starts at ~0
+        if self._theta0 is None:
+            self._theta0 = self._theta_unwrapped
+
+        flip_rel = self._theta_unwrapped - self._theta0   # progress angle [rad]
+        phi_deg = math.degrees(flip_rel)
+
+        # 6) IMU gyro for pitch rate: gyro[1] is rotation around body Y (rad/s)
+        gyro = self.data.sensordata[self.gyro_adr:self.gyro_adr + 3]
+        pitch_rate_rad = float(gyro[1])
+        phi_rate_deg = math.degrees(pitch_rate_rad)
+
+        return phi_deg, phi_rate_deg
 
     # ---------------- Core API ----------------
     def reset(self):
@@ -149,18 +240,25 @@ class MonsterTruckFlipEnvPitchSigned:
         # Upside-down spawn
         self.data.qpos[:3] = np.array([0, 0, 0.3]) + 0.01 * self.rng.normal(size=3)
         self.data.qvel[:] = 0.0
-        self.data.qpos[3:7] = np.array([0, 1, 0, 0])  # 180° about X → upside-down
+        # 180° about X → upside-down (matches your XML quat="0 1 0 0")
+        self.data.qpos[3:7] = np.array([0, 1, 0, 0])
         mujoco.mj_forward(self.model, self.data)
 
         self.step_count = 0
         self.last_throttle = 0.0
         self.hold_counter = 0
-        self._flip_sign = 0.0
 
-        phi = self._get_signed_flip_deg()
-        self.prev_phi_deg = phi
-        self.last_rate_deg = 0.0
-        return np.array([phi, 0.0], dtype=np.float32)
+        # Reset angle-unwrapping state
+        self._prev_theta = None
+        self._theta_unwrapped = 0.0
+        self._theta0 = None
+
+        # Initial φ, φ̇ from IMU / quaternion
+        phi_deg, phi_rate_deg = self._get_phi_and_rate_from_imu()
+        self.prev_phi_deg = phi_deg
+        self.last_rate_deg = phi_rate_deg
+
+        return np.array([phi_deg, phi_rate_deg], dtype=np.float32)
 
     def step(self, throttle):
         """Apply throttle ∈ [-1,1] to ALL wheel actuators for frame_skip steps."""
@@ -178,11 +276,8 @@ class MonsterTruckFlipEnvPitchSigned:
             if self.realtime:
                 time.sleep(self.dt)
 
-        # Signed angle and wrapped rate (DEGREES)
-        phi_deg = self._get_signed_flip_deg()
-        horizon_dt = max(self.frame_skip * self.dt, 1e-6)
-        dphi_deg = angdiff_deg(phi_deg, self.prev_phi_deg)
-        phi_rate_deg = dphi_deg / horizon_dt
+        # Signed flip angle and rate (DEGREES) from IMU / quaternion
+        phi_deg, phi_rate_deg = self._get_phi_and_rate_from_imu()
         phi_rate_rad = math.radians(phi_rate_deg)
 
         # --------- Reward terms ----------
@@ -196,14 +291,14 @@ class MonsterTruckFlipEnvPitchSigned:
         # Near-upright gate for braking term
         near_gate = np.exp(-12.0 * d_fwd_clip1)
 
-        # --- Linear, signed momentum (requested change) ---
-        # weight: 1 at upside-down (|φ|=0), 0 at upright (|φ|=180)
+        # --- Linear, signed momentum ---
+        # weight: 1 at upside-down (|φ|≈0), 0 at upright (|φ|≈180)
         w_lin = np.clip((180.0 - abs(phi_deg)) / 180.0, 0.0, 1.0)
-        # sign: >0 when motion increases |φ| (committing), <0 when motion reduces |φ| (over-rotating past upright)
+        # sign: >0 when motion increases |φ| (committing), <0 when motion reduces |φ|
         sign_phi = 1.0 if phi_deg >= 0.0 else -1.0
         mom_reward = self.R["momentum"] * w_lin * (sign_phi * phi_rate_rad)
 
-        # Keep brake near upright to avoid overshoot
+        # Keep brake near upright to avoid overshoot (currently disabled)
         vel_brake  = -self.R["stop_boost"] * near_gate * (phi_rate_rad ** 2)
         energy_pen = self.R["energy"] * (throttle ** 2)
         time_pen   = self.R["time"]
@@ -335,13 +430,14 @@ def evaluate_episode(env, agent, max_steps=1500, render=False):
     env.realtime = False
     return total, success_flag
 
+
 def run_greedy_trace(env, agent, max_steps=1500):
     obs = env.reset()
     t_steps, phi_deg_hist, phi_rate_hist, throttle_hist, rewards = [], [], [], [], []
     step = 0
     while step < max_steps:
-        p  = float(obs[0])   # φ (deg, signed)
-        pr = float(obs[1])   # φ rate (deg/s)
+        p  = float(obs[0])   # φ (deg, signed IMU-based)
+        pr = float(obs[1])   # φ rate (deg/s) from imu_gyro
         a_idx = agent.act_greedy(obs)
         throttle = float(agent.actions[a_idx])
 
@@ -366,9 +462,11 @@ def run_greedy_trace(env, agent, max_steps=1500):
     )
     return traces
 
+
 def save_episode_traces_figure(traces, outfile="qlearn_episode_summary.png"):
     def ema(x, alpha=0.25):
-        if len(x) == 0: return x
+        if len(x) == 0:
+            return x
         y = np.empty_like(x, dtype=float)
         y[0] = x[0]
         for i in range(1, len(x)):
@@ -387,26 +485,36 @@ def save_episode_traces_figure(traces, outfile="qlearn_episode_summary.png"):
 
     ax1.plot(t, p, lw=2)
     ax1.set_title("Signed Flip Angle φ vs Timestep (0°=upside-down, ±180°=goal)")
-    ax1.set_xlabel("Timestep"); ax1.set_ylabel("φ (deg)"); ax1.grid(True, alpha=0.3)
+    ax1.set_xlabel("Timestep")
+    ax1.set_ylabel("φ (deg)")
+    ax1.grid(True, alpha=0.3)
 
     ax2.plot(p, pr, lw=1.8)
-    ax2.set_title("dφ/dt vs φ"); ax2.set_xlabel("φ (deg)"); ax2.set_ylabel("dφ/dt (deg/s)")
+    ax2.set_title("dφ/dt vs φ")
+    ax2.set_xlabel("φ (deg)")
+    ax2.set_ylabel("dφ/dt (deg/s)")
     ax2.grid(True, alpha=0.3)
 
     ax3.plot(t, thr, lw=1, alpha=0.25)
     ax3.plot(t, thr_s, lw=2)
     ax3.set_title("Throttle vs Timestep (smoothed)")
-    ax3.set_xlabel("Timestep"); ax3.set_ylabel("Throttle"); ax3.grid(True, alpha=0.3)
+    ax3.set_xlabel("Timestep")
+    ax3.set_ylabel("Throttle")
+    ax3.grid(True, alpha=0.3)
 
     ax4.plot(t[:len(cre)], cre, lw=2)
     ax4.set_title("Cumulative Reward vs Timestep")
-    ax4.set_xlabel("Timestep"); ax4.set_ylabel("Cumulative Reward"); ax4.grid(True, alpha=0.3)
+    ax4.set_xlabel("Timestep")
+    ax4.set_ylabel("Cumulative Reward")
+    ax4.grid(True, alpha=0.3)
 
-    fig.suptitle("MonsterTruck Flip — Greedy Episode Summary (Tabular Q, Signed φ)", fontsize=14)
+    fig.suptitle("MonsterTruck Flip — Greedy Episode Summary (Tabular Q, IMU Signed φ)",
+                 fontsize=14)
     fig.tight_layout(rect=[0, 0.03, 1, 0.96])
     fig.savefig(outfile, dpi=220)
     plt.close(fig)
     print(f"📊 Saved episode traces figure to {outfile}")
+
 
 def save_eval_plots_and_csv(eval_ep_indices, eval_rewards):
     """Save (1) simple eps vs eval reward plot, (2) moving-avg plot, (3) CSV."""
@@ -424,17 +532,22 @@ def save_eval_plots_and_csv(eval_ep_indices, eval_rewards):
     plt.close()
     print("📈 Saved eps-vs-eval-reward plot to eval_eps_vs_reward.png")
 
-    # 2) Moving-avg variant (existing style)
+    # 2) Moving-avg variant
     plt.figure(figsize=(9, 5))
     plt.plot(eval_ep_indices, eval_rewards, 'o--', alpha=0.55, label='Eval reward')
     window = 5
     if len(eval_rewards) >= window:
         smoothed = np.convolve(eval_rewards, np.ones(window)/window, mode='valid')
-        plt.plot(eval_ep_indices[window-1:], smoothed, '-', lw=2.2, label=f'{window}-pt Moving Avg')
-    plt.xlabel("Episode"); plt.ylabel("Evaluation Reward")
-    plt.title("Q-Learning — Signed φ with linear momentum")
-    plt.legend(); plt.grid(True, alpha=0.3); plt.tight_layout()
-    plt.savefig("qlearn_pitch_eval.png", dpi=200); plt.close()
+        plt.plot(eval_ep_indices[window-1:], smoothed, '-', lw=2.2,
+                 label=f'{window}-pt Moving Avg')
+    plt.xlabel("Episode")
+    plt.ylabel("Evaluation Reward")
+    plt.title("Q-Learning — IMU Signed φ with linear momentum")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("qlearn_pitch_eval.png", dpi=200)
+    plt.close()
     print("📈 Saved moving-average eval plot to qlearn_pitch_eval.png")
 
     # 3) CSV dump
@@ -451,10 +564,12 @@ def save_eval_plots_and_csv(eval_ep_indices, eval_rewards):
 # ===============================================================
 def train(episodes=3000, max_steps=1500, eval_every=100, seed: int = 42,
           bins_phi=121, bins_rate=97, alpha=0.05, gamma=0.98):
-    np.random.seed(seed); random.seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
 
     env = MonsterTruckFlipEnvPitchSigned(render=False, realtime=False,
-                                         frame_skip=10, max_steps=max_steps, seed=seed)
+                                         frame_skip=10, max_steps=max_steps,
+                                         seed=seed)
 
     agent = QAgent(bins_phi=bins_phi, bins_rate=bins_rate,
                    alpha=alpha, gamma=gamma,
@@ -491,17 +606,23 @@ def train(episodes=3000, max_steps=1500, eval_every=100, seed: int = 42,
             last10 = rewards_list[-10:]
             succ10 = sum(success_flags[-10:])
             print(f"Ep {ep:4d} | eps {agent.eps:5.3f} | successes {successes}")
-            print(f"   Last 10 rewards: {[round(r, 2) for r in last10]}  ({succ10}/10 success)")
+            print(f"   Last 10 rewards: {[round(r, 2) for r in last10]}  "
+                  f"({succ10}/10 success)")
 
         # ---- Evaluation block (render only the FIRST rollout) ----
         if eval_every and (ep % eval_every == 0):
             eval_rs, eval_ss = [], []
             for i in range(3):
-                er, es = evaluate_episode(env, agent, max_steps=max_steps, render=(i == 0))
-                eval_rs.append(er); eval_ss.append(es)
-            mean_r, succ_rate = np.mean(eval_rs), np.mean(eval_ss) * 100
-            eval_ep_indices.append(ep); eval_rewards.append(mean_r)
-            print(f"[Eval @ Ep {ep}] avg_reward={mean_r:+9.3f} | success_rate={succ_rate:5.1f}% (rendered first)")
+                er, es = evaluate_episode(env, agent, max_steps=max_steps,
+                                          render=(i == 0))
+                eval_rs.append(er)
+                eval_ss.append(es)
+            mean_r = np.mean(eval_rs)
+            succ_rate = np.mean(eval_ss) * 100
+            eval_ep_indices.append(ep)
+            eval_rewards.append(mean_r)
+            print(f"[Eval @ Ep {ep}] avg_reward={mean_r:+9.3f} | "
+                  f"success_rate={succ_rate:5.1f}% (rendered first)")
 
     # Save eval curve plots + CSV
     save_eval_plots_and_csv(eval_ep_indices, eval_rewards)
@@ -517,7 +638,7 @@ def train(episodes=3000, max_steps=1500, eval_every=100, seed: int = 42,
 if __name__ == "__main__":
     # Batch prints every 10 episodes; renders first rollout during each eval period.
     rewards, eval_curve = train(
-        episodes=1000, max_steps=1500, eval_every=40, seed=42,
+        episodes=1000, max_steps=1000, eval_every=250, seed=42,
         bins_phi=121, bins_rate=97, alpha=0.05, gamma=0.98
     )
     print("✅ Done. Saved eval plots (eps vs reward + moving average), CSV, and greedy episode summary.")
