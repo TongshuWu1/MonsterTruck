@@ -69,7 +69,7 @@ class MonsterTruckFlipEnvPitchSigned:
         # Success hysteresis + velocity gate (fixes near-upright jitter)
         self.success_enter_deg    = 178.0  # start counting hold when |phi| >= 178°
         self.success_release_deg  = 176.5  # don't reset unless |phi| < 176.5°
-        self.max_upright_rate_deg = 60.0   # must be relatively still to count hold
+        self.max_upright_rate_deg = 300.0   # must be relatively still to count hold
 
         self.prev_phi_deg = 0.0
         self.last_rate_deg = 0.0
