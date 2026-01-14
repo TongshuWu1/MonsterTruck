@@ -60,16 +60,16 @@ class MonsterTruckFlipEnvPitchSigned:
             position=2.0,
             momentum=4.0,   # scales linear signed momentum
             stop_boost=0.00,
-            energy=0.2,
+            energy=0.0,
             time=1.0,
-            jerk=0.2,
-            success=1500.0
+            jerk=0.0,
+            success=800.0
         )
 
         # Success hysteresis + velocity gate (fixes near-upright jitter)
         self.success_enter_deg    = 178.0  # start counting hold when |phi| >= 178°
         self.success_release_deg  = 176.5  # don't reset unless |phi| < 176.5°
-        self.max_upright_rate_deg = 60.0   # must be relatively still to count hold
+        self.max_upright_rate_deg = 300.0   # must be relatively still to count hold
 
         self.prev_phi_deg = 0.0
         self.last_rate_deg = 0.0
@@ -449,12 +449,14 @@ def save_eval_plots_and_csv(eval_ep_indices, eval_rewards):
 # ===============================================================
 # Training (batch print every 10 episodes; render first eval rollout)
 # ===============================================================
-def train(episodes=3000, max_steps=1500, eval_every=100, seed: int = 42,
+def train(episodes=3000, max_steps=1000, eval_every=100, seed: int = 42,
           bins_phi=121, bins_rate=97, alpha=0.05, gamma=0.98):
     np.random.seed(seed); random.seed(seed)
 
+
     env = MonsterTruckFlipEnvPitchSigned(render=False, realtime=False,
                                          frame_skip=10, max_steps=max_steps, seed=seed)
+    print(env.dt)
 
     agent = QAgent(bins_phi=bins_phi, bins_rate=bins_rate,
                    alpha=alpha, gamma=gamma,
@@ -517,7 +519,7 @@ def train(episodes=3000, max_steps=1500, eval_every=100, seed: int = 42,
 if __name__ == "__main__":
     # Batch prints every 10 episodes; renders first rollout during each eval period.
     rewards, eval_curve = train(
-        episodes=1000, max_steps=1500, eval_every=40, seed=42,
+        episodes=1000, max_steps=1000, eval_every=40, seed=42,
         bins_phi=121, bins_rate=97, alpha=0.05, gamma=0.98
     )
     print("✅ Done. Saved eval plots (eps vs reward + moving average), CSV, and greedy episode summary.")
