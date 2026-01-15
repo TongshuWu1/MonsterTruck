@@ -14,7 +14,7 @@ import os, math
 import numpy as np
 import matplotlib.pyplot as plt
 
-from QLearning_Monstertruck import CarFlipIMUEnv, QAgent, OUTPUT_DIR
+from Tile_Monstertruck import CarFlipIMUEnv, QAgent, OUTPUT_DIR
 
 
 def phi_to_bin(phi_deg, n_phi_bins):

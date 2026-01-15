@@ -7,7 +7,7 @@ import time
 # ==============================
 # Load model
 # ==============================
-xml_path = os.path.join(os.path.dirname(__file__), "monstertruck.model")
+xml_path = os.path.join(os.path.dirname(__file__), "monstertruck.xml")
 if not os.path.exists(xml_path):
     raise FileNotFoundError(f"XML file not found: {xml_path}")
 
