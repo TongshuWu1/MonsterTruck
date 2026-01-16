@@ -7,7 +7,7 @@
           <value>
             <JupyterConnectionParameters>
               <option name="managed" value="true" />
-              <option name="sdkName" value="" />
+              <option name="sdkName" value="Python 3.12" />
             </JupyterConnectionParameters>
           </value>
         </entry>
