@@ -1,15 +1,6 @@
 # ===============================================================
-# QLearning_Monstertruck_PitchSigned_LinMom_BATCH10.py
-# Tabular Q-learning on [phi_deg, phi_rate_deg] with 9 actions
-# - Environment: signed-φ reward with linear, signed momentum term
-# - Success: hysteresis + velocity gate for reliable termination
-# - Printing: store per-episode rewards; print the last-10 as a batch
-# - Eval: every eval_every episodes, run 3 eval rollouts and RENDER ONLY THE FIRST
-# - Plots: (1) evaluation reward vs episode (explicit "eps vs eval reward")
-#          (2) evaluation reward with moving average
-#          (3) greedy episode summary
-# Requires: pip install mujoco glfw numpy matplotlib
-# Python 3.10+
+# QLearning_Monstertruck_PitchSigned_LinMom_BATCH10_TARGET90.py
+# Target: |phi| = 90 degrees (instead of 180 upright)
 # ===============================================================
 
 import os, math, time, random, json, csv
@@ -29,9 +20,9 @@ def angdiff_deg(curr, prev):
 
 
 # ===============================================================
-# Environment: Signed φ + forward-goal distance
-# - Linear, signed momentum term
-# - Success hysteresis + velocity gate
+# Environment: Signed φ + target |φ|=90°
+# - Linear momentum term pushes TOWARD target (not always toward 180°)
+# - Success: hysteresis + velocity gate around target
 # ===============================================================
 class MonsterTruckFlipEnvPitchSigned:
     def __init__(self, xml_path="monstertruck.xml",
@@ -55,10 +46,17 @@ class MonsterTruckFlipEnvPitchSigned:
 
         self.body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "chassis")
 
-        # Reward weights (base = original; momentum term is changed in form only)
+        # ---------------- Target angle ----------------
+        # φ definition:
+        #   φ=0   -> upside-down
+        #   |φ|=180 -> upright
+        # NEW GOAL: |φ| = 90°
+        self.target_deg = 90.0
+
+        # Reward weights
         self.R = dict(
             position=2.0,
-            momentum=4.0,   # scales linear signed momentum
+            momentum=4.0,   # scales signed momentum (toward target)
             stop_boost=0.00,
             energy=0.0,
             time=1.0,
@@ -66,10 +64,10 @@ class MonsterTruckFlipEnvPitchSigned:
             success=800.0
         )
 
-        # Success hysteresis + velocity gate (fixes near-upright jitter)
-        self.success_enter_deg    = 178.0  # start counting hold when |phi| >= 178°
-        self.success_release_deg  = 176.5  # don't reset unless |phi| < 176.5°
-        self.max_upright_rate_deg = 300.0   # must be relatively still to count hold
+        # Success hysteresis around target (in degrees ERROR)
+        self.success_enter_err_deg   = 2.0   # start counting hold when | |phi|-target | <= 2°
+        self.success_release_err_deg = 3.5   # reset hold only if error exceeds 3.5°
+        self.max_upright_rate_deg = 300.0    # must be relatively still to count hold
 
         self.prev_phi_deg = 0.0
         self.last_rate_deg = 0.0
@@ -95,7 +93,7 @@ class MonsterTruckFlipEnvPitchSigned:
             return
         if not glfw.init():
             raise RuntimeError("GLFW init failed")
-        self.window = glfw.create_window(1000, 800, "MonsterTruck Flip (Signed φ, Forward Goal)", None, None)
+        self.window = glfw.create_window(1000, 800, "MonsterTruck Flip (Signed φ, Target=90°)", None, None)
         glfw.make_context_current(self.window)
         glfw.swap_interval(1)
         self.cam = mujoco.MjvCamera()
@@ -185,26 +183,41 @@ class MonsterTruckFlipEnvPitchSigned:
         phi_rate_deg = dphi_deg / horizon_dt
         phi_rate_rad = math.radians(phi_rate_deg)
 
-        # --------- Reward terms ----------
-        d_fwd = (180.0 - phi_deg) / 180.0
-        d_fwd_clip2 = np.clip(d_fwd, 0.0, 2.0)
-        d_fwd_clip1 = np.clip(d_fwd, 0.0, 1.0)
+        # ---------------------------------------------------------
+        # Target distance: goal is |phi| = target_deg (90°)
+        # ---------------------------------------------------------
+        phi_abs = abs(phi_deg)
+        err_deg = abs(phi_abs - self.target_deg)          # 0 when at target
+        err = err_deg / max(self.target_deg, 1e-6)        # normalized error
 
-        # Position penalty (unchanged)
-        pos_penalty = self.R["position"] * (np.tanh(2.2 * d_fwd_clip2) ** 2)
+        err_clip2 = np.clip(err, 0.0, 2.0)
+        err_clip1 = np.clip(err, 0.0, 1.0)
 
-        # Near-upright gate for braking term
-        near_gate = np.exp(-12.0 * d_fwd_clip1)
+        # Position penalty: minimize error to target
+        pos_penalty = self.R["position"] * (np.tanh(2.2 * err_clip2) ** 2)
 
-        # --- Linear, signed momentum (requested change) ---
-        # weight: 1 at upside-down (|φ|=0), 0 at upright (|φ|=180)
-        w_lin = np.clip((180.0 - abs(phi_deg)) / 180.0, 0.0, 1.0)
-        # sign: >0 when motion increases |φ| (committing), <0 when motion reduces |φ| (over-rotating past upright)
+        # Near-target gate (1 near target, 0 far)
+        near_gate = np.exp(-12.0 * err_clip1)
+
+        # ---------------------------------------------------------
+        # Momentum reward: encourage moving TOWARD target
+        # ---------------------------------------------------------
+        # approx: d|phi|/dt ≈ sign(phi) * phi_rate
         sign_phi = 1.0 if phi_deg >= 0.0 else -1.0
-        mom_reward = self.R["momentum"] * w_lin * (sign_phi * phi_rate_rad)
+        abs_rate_rad = sign_phi * phi_rate_rad    # >0 means |phi| increasing
 
-        # Keep brake near upright to avoid overshoot
+        # If below target -> want |phi| to increase
+        # If above target -> want |phi| to decrease
+        dir_to_target = 1.0 if phi_abs < self.target_deg else -1.0
+
+        # Stronger far away from target, weaker near target
+        w_lin = np.clip(err_clip1, 0.0, 1.0)
+
+        mom_reward = self.R["momentum"] * w_lin * (dir_to_target * abs_rate_rad)
+
+        # Optional braking near target (still off by default unless stop_boost > 0)
         vel_brake  = -self.R["stop_boost"] * near_gate * (phi_rate_rad ** 2)
+
         energy_pen = self.R["energy"] * (throttle ** 2)
         time_pen   = self.R["time"]
         jerk_pen   = self.R["jerk"] * abs(throttle - prev_throttle)
@@ -212,11 +225,12 @@ class MonsterTruckFlipEnvPitchSigned:
         reward = -pos_penalty + mom_reward + vel_brake - energy_pen - time_pen - jerk_pen
         reward = clip(reward, -10.0, 10.0)
 
-        # --------- Success with hysteresis + velocity gate ----------
-        phi_abs = abs(phi_deg)
-        if (phi_abs >= self.success_enter_deg) and (abs(phi_rate_deg) <= self.max_upright_rate_deg):
+        # ---------------------------------------------------------
+        # Success: hysteresis on error-to-target + velocity gate
+        # ---------------------------------------------------------
+        if (err_deg <= self.success_enter_err_deg) and (abs(phi_rate_deg) <= self.max_upright_rate_deg):
             self.hold_counter += 1
-        elif phi_abs < self.success_release_deg:
+        elif err_deg > self.success_release_err_deg:
             self.hold_counter = 0
 
         if self.hold_counter >= self.hold_needed:
@@ -228,7 +242,8 @@ class MonsterTruckFlipEnvPitchSigned:
             ctrl_vals = np.round(self.data.ctrl[:self.model.nu], 3)
             print(
                 f"[Render] step={self.step_count:4d} | "
-                f"phi={phi_deg:+7.2f}° | dφ/dt={phi_rate_deg:+8.2f}°/s | "
+                f"phi={phi_deg:+7.2f}° | |phi|={phi_abs:7.2f}° | err={err_deg:6.2f}° | "
+                f"dφ/dt={phi_rate_deg:+8.2f}°/s | "
                 f"u={throttle:+.3f} | ctrl={ctrl_vals} | hold={self.hold_counter}"
             )
 
@@ -386,7 +401,7 @@ def save_episode_traces_figure(traces, outfile="qlearn_episode_summary.png"):
     (ax1, ax2), (ax3, ax4) = axs
 
     ax1.plot(t, p, lw=2)
-    ax1.set_title("Signed Flip Angle φ vs Timestep (0°=upside-down, ±180°=goal)")
+    ax1.set_title("Signed Flip Angle φ vs Timestep (0°=upside-down, ±90°=goal)")
     ax1.set_xlabel("Timestep"); ax1.set_ylabel("φ (deg)"); ax1.grid(True, alpha=0.3)
 
     ax2.plot(p, pr, lw=1.8)
@@ -402,7 +417,7 @@ def save_episode_traces_figure(traces, outfile="qlearn_episode_summary.png"):
     ax4.set_title("Cumulative Reward vs Timestep")
     ax4.set_xlabel("Timestep"); ax4.set_ylabel("Cumulative Reward"); ax4.grid(True, alpha=0.3)
 
-    fig.suptitle("MonsterTruck Flip — Greedy Episode Summary (Tabular Q, Signed φ)", fontsize=14)
+    fig.suptitle("MonsterTruck Flip — Greedy Episode Summary (Tabular Q, Target=90°)", fontsize=14)
     fig.tight_layout(rect=[0, 0.03, 1, 0.96])
     fig.savefig(outfile, dpi=220)
     plt.close(fig)
@@ -424,7 +439,7 @@ def save_eval_plots_and_csv(eval_ep_indices, eval_rewards):
     plt.close()
     print("📈 Saved eps-vs-eval-reward plot to eval_eps_vs_reward.png")
 
-    # 2) Moving-avg variant (existing style)
+    # 2) Moving-avg variant
     plt.figure(figsize=(9, 5))
     plt.plot(eval_ep_indices, eval_rewards, 'o--', alpha=0.55, label='Eval reward')
     window = 5
@@ -432,7 +447,7 @@ def save_eval_plots_and_csv(eval_ep_indices, eval_rewards):
         smoothed = np.convolve(eval_rewards, np.ones(window)/window, mode='valid')
         plt.plot(eval_ep_indices[window-1:], smoothed, '-', lw=2.2, label=f'{window}-pt Moving Avg')
     plt.xlabel("Episode"); plt.ylabel("Evaluation Reward")
-    plt.title("Q-Learning — Signed φ with linear momentum")
+    plt.title("Q-Learning — Signed φ with momentum toward target=90°")
     plt.legend(); plt.grid(True, alpha=0.3); plt.tight_layout()
     plt.savefig("qlearn_pitch_eval.png", dpi=200); plt.close()
     print("📈 Saved moving-average eval plot to qlearn_pitch_eval.png")
@@ -451,8 +466,8 @@ def save_eval_plots_and_csv(eval_ep_indices, eval_rewards):
 # ===============================================================
 def train(episodes=3000, max_steps=1000, eval_every=100, seed: int = 42,
           bins_phi=121, bins_rate=97, alpha=0.05, gamma=0.98):
-    np.random.seed(seed); random.seed(seed)
 
+    np.random.seed(seed); random.seed(seed)
 
     env = MonsterTruckFlipEnvPitchSigned(render=False, realtime=False,
                                          frame_skip=10, max_steps=max_steps, seed=seed)
@@ -517,7 +532,6 @@ def train(episodes=3000, max_steps=1000, eval_every=100, seed: int = 42,
 
 
 if __name__ == "__main__":
-    # Batch prints every 10 episodes; renders first rollout during each eval period.
     rewards, eval_curve = train(
         episodes=1000, max_steps=1000, eval_every=40, seed=42,
         bins_phi=121, bins_rate=97, alpha=0.05, gamma=0.98
