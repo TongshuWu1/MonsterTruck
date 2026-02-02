@@ -1,0 +1,12 @@
+{
+  "name": "PALSGP",
+  "n_data": 596,
+  "n_inducing": 128,
+  "fit_calls": 1,
+  "update_calls": 0,
+  "predict_calls": 210,
+  "fit_ms": 7380.359199974919,
+  "update_ms": 0.0,
+  "predict_ms": 6231.55820008833,
+  "kind": "palsgp"
+}

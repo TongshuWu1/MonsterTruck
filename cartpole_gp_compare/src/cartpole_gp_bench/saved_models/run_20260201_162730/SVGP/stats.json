@@ -1,0 +1,15 @@
+{
+  "name": "SVGP",
+  "n_data": 596,
+  "n_inducing": 256,
+  "fit_calls": 1,
+  "update_calls": 0,
+  "predict_calls": 210,
+  "fit_ms": 5388.360700017074,
+  "update_ms": 0.0,
+  "predict_ms": 11171.635300066555,
+  "kind": "svgp",
+  "M": 256,
+  "max_data": null,
+  "noise": 0.0001
+}
