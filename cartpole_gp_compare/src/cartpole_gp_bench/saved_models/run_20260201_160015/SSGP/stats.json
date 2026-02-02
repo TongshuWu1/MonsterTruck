@@ -1,0 +1,13 @@
+{
+  "name": "SSGP",
+  "n_data": 596,
+  "n_inducing": 128,
+  "fit_calls": 1,
+  "update_calls": 0,
+  "predict_calls": 210,
+  "fit_ms": 6934.685399988666,
+  "update_ms": 0.0,
+  "predict_ms": 3766.0376999992877,
+  "kind": "ssgp_fixedM",
+  "M_init": 128
+}
